@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -72,11 +71,7 @@ func (d *DockerRunner) Run(ctx context.Context, t Trial) TrialResult {
 	// container might not run as us
 	_ = os.Chmod(trialDir, 0o777)
 
-	cmd := []string{
-		"pytest", "-q", "-p", "no:cacheprovider",
-		"--randomly-seed=" + strconv.FormatInt(t.Seed, 10),
-		"--junitxml=/results/junit.xml",
-	}
+	cmd := PytestArgs(t, "/results/junit.xml")
 
 	hostCfg := &container.HostConfig{Binds: []string{trialDir + ":/results"}}
 	hostCfg.Resources.CpusetCpus = res.CPUSet

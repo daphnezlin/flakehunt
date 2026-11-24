@@ -3,6 +3,7 @@ package main
 import (
 	"math"
 	"math/rand"
+	"strings"
 	"testing"
 )
 
@@ -90,10 +91,25 @@ func TestAnalyzeZooShape(t *testing.T) {
 		"order": {Runs: 5, Failures: 5},
 	}
 	got := map[string]string{}
-	for _, c := range Analyze(agg, replays) {
+	for _, c := range Analyze(agg, replays, nil) {
 		got[c.Test] = c.Label
 	}
 	if got["race"] != "timing" || got["order"] != "seed-dependent" {
 		t.Errorf("got %v", got)
+	}
+}
+
+func TestClassifySeed(t *testing.T) {
+	seed := Cause{CPUTested: true, CPUq: 0.9, Replays: Count{Runs: 5, Failures: 5}}
+
+	alone := seed
+	alone.Polluter = &PolluterResult{FailsAlone: true}
+	if got, _ := classify(alone); got != "random data" {
+		t.Errorf("fails alone: got %q", got)
+	}
+	order := seed
+	order.Polluter = &PolluterResult{Polluter: "tests.m::test_create"}
+	if got, detail := classify(order); got != "order-dependent" || !strings.Contains(detail, "test_create") {
+		t.Errorf("polluter: got %q %q", got, detail)
 	}
 }

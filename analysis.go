@@ -18,6 +18,7 @@ type Cause struct {
 	CPUp      float64 // raw p-value for "fails more with less cpu"
 	CPUq      float64 // p-value adjusted for testing many tests at once
 	Replays   Count   // reruns of a failing seed with no cpu limit
+	Polluter  *PolluterResult
 	Label     string
 	Detail    string
 }
@@ -95,8 +96,9 @@ func BenjaminiHochberg(ps []float64) []float64 {
 	return qs
 }
 
-// Analyze works out a cause for every flaky test. replays is keyed by test name.
-func Analyze(agg *Aggregate, replays map[string]*Count) []Cause {
+// Analyze works out a cause for every flaky test. replays and polluters are
+// keyed by test name and either can be nil.
+func Analyze(agg *Aggregate, replays map[string]*Count, polluters map[string]PolluterResult) []Cause {
 	// fixed seed so the same run always gives the same p-values
 	rng := rand.New(rand.NewSource(1))
 
@@ -115,6 +117,9 @@ func Analyze(agg *Aggregate, replays map[string]*Count) []Cause {
 		}
 		if r := replays[s.Name]; r != nil {
 			c.Replays = *r
+		}
+		if p, ok := polluters[s.Name]; ok {
+			c.Polluter = &p
 		}
 		causes = append(causes, c)
 	}
@@ -137,6 +142,8 @@ func classify(c Cause) (label, detail string) {
 	switch {
 	case seed && cpu:
 		return "seed + timing", "fails every time with this seed, and also fails more with less cpu"
+	case seed && c.Polluter != nil:
+		return classifySeed(*c.Polluter)
 	case seed:
 		return "seed-dependent", "fails every time with the same seed, so it depends on test order or random data, not timing"
 	case cpu:
@@ -145,5 +152,19 @@ func classify(c Cause) (label, detail string) {
 		return "nondeterministic", "same seed sometimes passes, so not order or random data, and no clear link to cpu (try more runs)"
 	default:
 		return "unknown", "not enough evidence, try more runs or turn on replays"
+	}
+}
+
+// classifySeed splits seed-dependent tests into random data vs order.
+func classifySeed(p PolluterResult) (label, detail string) {
+	switch {
+	case p.FailsAlone:
+		return "random data", "fails even when run on its own with this seed, so it's the random values the seed produces, not other tests"
+	case p.Polluter != "":
+		return "order-dependent", "fails when it runs after " + p.Polluter + ", which leaves state behind"
+	case p.Note != "":
+		return "order-dependent", "passes on its own but fails in the full run order (" + p.Note + ")"
+	default:
+		return "order-dependent", "passes on its own but fails in the full run order"
 	}
 }

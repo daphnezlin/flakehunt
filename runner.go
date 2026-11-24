@@ -8,9 +8,11 @@ type Trial struct {
 	Seed int64   // pytest-randomly seed (controls order + random data)
 	CPUs float64 // cpu limit for this trial, 0 = no limit
 
-	// set on replay trials: the flaky test this rerun is checking.
-	// replays don't count towards failure rates
+	// set on replay and probe trials: the flaky test this rerun is checking.
+	// these don't count towards failure rates
 	ReplayFor string
+	Probe     string   // "polluter" for polluter search runs
+	Tests     []string // node ids to run in this order, empty = whole suite
 }
 
 type TrialResult struct {

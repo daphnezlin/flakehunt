@@ -84,6 +84,10 @@ type TestStats struct {
 	Count
 	ByCPU   map[float64]*Count
 	Failing []Trial // trials where it failed, for repro commands
+
+	// every test's result from the first failing trial, in the order they ran.
+	// the polluter search needs to know what ran before it
+	FirstFailure []TestOutcome
 }
 
 // passed and failed on the same code
@@ -129,6 +133,9 @@ func (a *Aggregate) Add(res TrialResult) {
 			s.Failures++
 			c.Failures++
 			s.Failing = append(s.Failing, res.Trial)
+			if s.FirstFailure == nil {
+				s.FirstFailure = res.Tests
+			}
 		}
 	}
 }
