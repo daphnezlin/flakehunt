@@ -1,3 +1,6 @@
 flakehunt-out/
 /flakehunt
 .DS_Store
+flakehunt.db
+flakehunt.db-wal
+flakehunt.db-shm
