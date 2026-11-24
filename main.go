@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -22,7 +23,7 @@ func main() {
 		Short: "Find flaky tests by running a suite many times under controlled conditions",
 	}
 	root.PersistentFlags().StringVar(&dbPath, "db", "flakehunt.db", "SQLite file where runs are saved")
-	root.AddCommand(runCmd(), runsCmd(), reportCmd())
+	root.AddCommand(runCmd(), runsCmd(), reportCmd(), scoreCmd())
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
 	}
@@ -380,4 +381,107 @@ func reportCmd() *cobra.Command {
 	// --markdown on its own uses the default path
 	cmd.Flags().Lookup("markdown").NoOptDefVal = defaultMarkdownPath
 	return cmd
+}
+
+func scoreCmd() *cobra.Command {
+	var expectedPath string
+	cmd := &cobra.Command{
+		Use:   "score <run-id>...",
+		Short: "Check saved runs against known causes, e.g. the flaky zoo",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			expected, err := LoadExpected(expectedPath)
+			if err != nil {
+				return err
+			}
+			store, err := OpenStore(dbPath)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+
+			var total ScoreSummary
+			right := map[string]int{} // runs where each test was scored correctly
+			got := map[string][]string{}
+			for _, arg := range args {
+				runID, err := strconv.ParseInt(arg, 10, 64)
+				if err != nil {
+					return fmt.Errorf("run id should be a number, got %q", arg)
+				}
+				agg, err := store.LoadAggregate(runID)
+				if err != nil {
+					return err
+				}
+				replays, err := store.LoadReplays(runID)
+				if err != nil {
+					return err
+				}
+				polluters, err := store.LoadPolluters(runID)
+				if err != nil {
+					return err
+				}
+				verdicts := Score(agg, Analyze(agg, replays, polluters), expected)
+				total.Add(Summarize(verdicts, expected))
+				for _, v := range verdicts {
+					if v.Correct {
+						right[v.Test]++
+					}
+					got[v.Test] = append(got[v.Test], v.Got)
+				}
+			}
+
+			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+			fmt.Fprintln(w, "TEST\tEXPECTED\tCORRECT\tFLAKEHUNT SAID")
+			names := make([]string, 0, len(got))
+			for n := range got {
+				names = append(names, n)
+			}
+			sort.Strings(names)
+			for _, n := range names {
+				want := expected[n].Cause
+				if want == "" {
+					want = "(not in file)"
+				}
+				fmt.Fprintf(w, "%s\t%s\t%d/%d\t%s\n", n, want, right[n], len(args), summarizeLabels(got[n]))
+			}
+			w.Flush()
+
+			fmt.Printf("\nacross %d run(s):\n", len(args))
+			fmt.Printf("  flaky tests found:   %d/%d (%s)\n", total.FlakyFound, total.FlakyTotal, pct(total.FlakyFound, total.FlakyTotal))
+			fmt.Printf("  false positives:     %d/%d stable tests flagged\n", total.FalsePositives, total.Stable)
+			fmt.Printf("  causes correct:      %d/%d (%s)\n", total.CausesRight, total.CausesTotal, pct(total.CausesRight, total.CausesTotal))
+			if total.Polluted > 0 {
+				fmt.Printf("  polluters correct:   %d/%d (%s)\n", total.PollutersRight, total.Polluted, pct(total.PollutersRight, total.Polluted))
+			}
+			if total.NotRun > 0 {
+				fmt.Printf("  not run:             %d (in the expected file but missing from a run, not scored)\n", total.NotRun)
+			}
+			if total.Unexpected > 0 {
+				fmt.Printf("  unexpected flaky:    %d (flagged but not in the expected file)\n", total.Unexpected)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&expectedPath, "expected", "flaky-zoo/expected.json", "json file with each test's true cause")
+	return cmd
+}
+
+// summarizeLabels turns ["timing","timing","nondeterministic"] into "timing x2, nondeterministic x1".
+func summarizeLabels(labels []string) string {
+	counts := map[string]int{}
+	var order []string
+	for _, l := range labels {
+		if counts[l] == 0 {
+			order = append(order, l)
+		}
+		counts[l]++
+	}
+	parts := make([]string, len(order))
+	for i, l := range order {
+		parts[i] = fmt.Sprintf("%s x%d", l, counts[l])
+		if len(labels) == 1 {
+			parts[i] = l
+		}
+	}
+	return strings.Join(parts, ", ")
 }

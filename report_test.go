@@ -98,9 +98,15 @@ func TestWriteMarkdownFile(t *testing.T) {
 
 func TestReproForLatency(t *testing.T) {
 	s := &TestStats{Failing: []Trial{{Seed: 5, CPUs: 0.5, LatencyMS: 150}}}
-	r := reproFor(s, nil, "zoo", nil)
+	network := &Cause{NetTested: true, NetQ: 0.001}
+	r := reproFor(s, network, "zoo", nil)
 	if !strings.Contains(r.Cmd, "--cpus 0.5") || !strings.Contains(r.Note, "--latency-levels 150") || r.Minimal {
 		t.Errorf("got %+v", r)
+	}
+	// a timing test that happened to fail with latency shouldn't point at the network
+	timing := &Cause{NetTested: true, NetQ: 0.8, CPUTested: true, CPUq: 0.001}
+	if r := reproFor(s, timing, "zoo", nil); r.Note != "" {
+		t.Errorf("latency note on a non-network test: %q", r.Note)
 	}
 }
 
