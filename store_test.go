@@ -118,3 +118,32 @@ func TestReplaysKeptSeparate(t *testing.T) {
 		t.Errorf("run list should not count replays, got %d", runs[0].Trials)
 	}
 }
+
+func TestPolluterStorage(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	runID, _ := store.CreateRun(RunInfo{StartedAt: time.Now(), Image: "zoo"})
+	// a replay and a probe for the same test; only the replay counts as a replay
+	store.SaveTrial(runID, TrialResult{Trial: Trial{ID: 1, ReplayFor: "v"}, Tests: []TestOutcome{{Name: "v", Failed: true}}})
+	store.SaveTrial(runID, TrialResult{Trial: Trial{ID: 2, ReplayFor: "v", Probe: "polluter"}, Tests: []TestOutcome{{Name: "v"}}})
+
+	want := PolluterResult{Polluter: "p", PolluterNode: "t.py::p", VictimNode: "t.py::v", Probes: 4}
+	if err := store.SavePolluter(runID, "v", want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.LoadPolluters(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["v"] != want {
+		t.Errorf("got %+v, want %+v", got["v"], want)
+	}
+	replays, _ := store.LoadReplays(runID)
+	if c := replays["v"]; c == nil || c.Runs != 1 {
+		t.Errorf("probes leaked into replays: %+v", replays)
+	}
+}

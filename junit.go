@@ -6,9 +6,9 @@ import (
 	"io"
 )
 
-// TestOutcome is the result of one test in one trial.
 type TestOutcome struct {
-	Name   string // "classname::name", unique per test
+	Name   string // classname::name
+	NodeID string // pytest node id, "" if the xml has no file path
 	Failed bool   // failure or error
 	Skip   bool
 }
@@ -16,6 +16,7 @@ type TestOutcome struct {
 type junitCase struct {
 	ClassName string    `xml:"classname,attr"`
 	Name      string    `xml:"name,attr"`
+	File      string    `xml:"file,attr"`
 	Failure   *struct{} `xml:"failure"`
 	Error     *struct{} `xml:"error"`
 	Skipped   *struct{} `xml:"skipped"`
@@ -26,8 +27,7 @@ type junitSuite struct {
 	Suites []junitSuite `xml:"testsuite"`
 }
 
-// ParseJUnit reads a JUnit XML report. It accepts both a <testsuites> root
-// (pytest's default) and a bare <testsuite> root, including nested suites.
+// ParseJUnit handles <testsuites> or <testsuite> roots, including nested suites.
 func ParseJUnit(r io.Reader) ([]TestOutcome, error) {
 	var root junitSuite
 	if err := xml.NewDecoder(r).Decode(&root); err != nil {
@@ -39,6 +39,7 @@ func ParseJUnit(r io.Reader) ([]TestOutcome, error) {
 		for _, c := range s.Cases {
 			out = append(out, TestOutcome{
 				Name:   c.ClassName + "::" + c.Name,
+				NodeID: NodeID(c.File, c.ClassName, c.Name),
 				Failed: c.Failure != nil || c.Error != nil,
 				Skip:   c.Skipped != nil,
 			})

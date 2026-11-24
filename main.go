@@ -35,6 +35,7 @@ func runCmd() *cobra.Command {
 		workers   int
 		cpuLevels []float64
 		replays   int
+		polluters bool
 		timeout   time.Duration
 		env       []string
 		outDir    string
@@ -88,9 +89,18 @@ func runCmd() *cobra.Command {
 			}
 			fmt.Fprintf(os.Stderr, "\n  finished in %s\n", time.Since(start).Round(time.Second))
 
+			lastID := len(trials) // replays and probes get ids after the normal trials
 			var replayCounts map[string]*Count
 			if ctx.Err() == nil && replays > 0 {
-				replayCounts, err = runReplays(ctx, store, runID, runner, agg, replays, workers, len(trials))
+				replayCounts, lastID, err = runReplays(ctx, store, runID, runner, agg, replays, workers, lastID)
+				if err != nil {
+					return err
+				}
+			}
+
+			var found map[string]PolluterResult
+			if ctx.Err() == nil && polluters {
+				found, err = runPolluterSearch(ctx, store, runID, runner, agg, replayCounts, lastID)
 				if err != nil {
 					return err
 				}
@@ -103,7 +113,7 @@ func runCmd() *cobra.Command {
 				return err
 			}
 
-			printReport(agg, Analyze(agg, replayCounts), image, env)
+			printReport(agg, Analyze(agg, replayCounts, found), image, env)
 			fmt.Printf("\nsaved as run #%d in %s (see it again with: flakehunt report %d)\n", runID, dbPath, runID)
 			return ctx.Err()
 		},
@@ -115,6 +125,7 @@ func runCmd() *cobra.Command {
 	f.IntVar(&workers, "workers", max(1, runtime.NumCPU()/2), "trials running at once")
 	f.Float64SliceVar(&cpuLevels, "cpu-levels", []float64{0, 1, 0.5}, "CPU limits to spread across trials, 0 = no limit")
 	f.IntVar(&replays, "replays", 5, "reruns of each flaky test's failing seed, to check if the seed alone causes it (0 = off)")
+	f.BoolVar(&polluters, "find-polluters", true, "for seed-dependent tests, check if they fail alone and find which earlier test breaks them")
 	f.DurationVar(&timeout, "timeout", 5*time.Minute, "per-trial timeout; longer runs count as hangs")
 	f.StringArrayVar(&env, "env", nil, "env var for every trial, KEY=VALUE (repeatable)")
 	f.StringVar(&outDir, "out", "flakehunt-out", "folder for per-trial results")
@@ -127,7 +138,7 @@ func runCmd() *cobra.Command {
 // If it fails every time, the seed (test order or random data) is enough to
 // cause it. If it sometimes passes, something else like timing is involved.
 func runReplays(ctx context.Context, store *Store, runID int64, runner Runner, agg *Aggregate,
-	per, workers, lastID int) (map[string]*Count, error) {
+	per, workers, lastID int) (map[string]*Count, int, error) {
 
 	var trials []Trial
 	for _, s := range agg.Sorted() {
@@ -140,7 +151,7 @@ func runReplays(ctx context.Context, store *Store, runID int64, runner Runner, a
 		}
 	}
 	if len(trials) == 0 {
-		return nil, nil
+		return nil, lastID, nil
 	}
 
 	fmt.Fprintf(os.Stderr, "  replaying failing seeds\n")
@@ -148,7 +159,7 @@ func runReplays(ctx context.Context, store *Store, runID int64, runner Runner, a
 	done := 0
 	for res := range RunAll(ctx, runner, trials, workers) {
 		if err := store.SaveTrial(runID, res); err != nil {
-			return nil, fmt.Errorf("save replay %d: %w", res.Trial.ID, err)
+			return nil, lastID, fmt.Errorf("save replay %d: %w", res.Trial.ID, err)
 		}
 		done++
 		fmt.Fprintf(os.Stderr, "\r  %d/%d replays done", done, len(trials))
@@ -170,7 +181,69 @@ func runReplays(ctx context.Context, store *Store, runID int64, runner Runner, a
 		}
 	}
 	fmt.Fprintln(os.Stderr)
-	return counts, nil
+	return counts, lastID, nil
+}
+
+// runPolluterSearch runs FindPolluter for every test whose failing seed failed
+// every replay. Searches run one probe at a time since each step depends on the
+// last one. lastID is the highest trial id used so far.
+func runPolluterSearch(ctx context.Context, store *Store, runID int64, runner Runner, agg *Aggregate,
+	replays map[string]*Count, lastID int) (map[string]PolluterResult, error) {
+
+	found := map[string]PolluterResult{}
+	nextID := lastID
+	for _, c := range Analyze(agg, replays, nil) {
+		if c.Label != "seed-dependent" {
+			continue
+		}
+		s := agg.Tests[c.Test]
+		seed := s.Failing[0].Seed
+
+		var victim TestOutcome
+		var before []TestOutcome
+		for i, o := range s.FirstFailure {
+			if o.Name == c.Test {
+				victim, before = o, s.FirstFailure[:i]
+				break
+			}
+		}
+
+		fmt.Fprintf(os.Stderr, "  searching for what breaks %s\n", c.Test)
+		var saveErr error
+		probe := func(nodeIDs []string) (bool, bool, error) {
+			if ctx.Err() != nil {
+				return false, false, ctx.Err()
+			}
+			nextID++
+			res := runner.Run(ctx, Trial{ID: nextID, Seed: seed, ReplayFor: c.Test, Probe: "polluter", Tests: nodeIDs})
+			if err := store.SaveTrial(runID, res); err != nil {
+				saveErr = err
+				return false, false, err
+			}
+			if res.Err != nil {
+				return false, false, res.Err
+			}
+			if res.TimedOut {
+				return false, false, fmt.Errorf("timed out")
+			}
+			for _, o := range res.Tests {
+				if o.Name == c.Test && !o.Skip {
+					return o.Failed, true, nil
+				}
+			}
+			return false, false, nil
+		}
+
+		result := FindPolluter(victim, before, probe)
+		if saveErr != nil {
+			return nil, fmt.Errorf("save probe: %w", saveErr)
+		}
+		if err := store.SavePolluter(runID, c.Test, result); err != nil {
+			return nil, err
+		}
+		found[c.Test] = result
+	}
+	return found, nil
 }
 
 func runsCmd() *cobra.Command {
@@ -237,9 +310,13 @@ func reportCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			polluters, err := store.LoadPolluters(runID)
+			if err != nil {
+				return err
+			}
 			fmt.Printf("run #%d, %s, %d trials, %d workers\n\n",
 				run.ID, run.StartedAt.Local().Format("2006-01-02 15:04"), agg.Trials, run.Workers)
-			printReport(agg, Analyze(agg, replays), run.Image, run.Env)
+			printReport(agg, Analyze(agg, replays, polluters), run.Image, run.Env)
 			return nil
 		},
 	}
@@ -293,6 +370,9 @@ func printReport(agg *Aggregate, causes []Cause, image string, env []string) {
 		if c.Replays.Runs > 0 {
 			evidence = append(evidence, fmt.Sprintf("failing seed rerun %d/%d failed", c.Replays.Failures, c.Replays.Runs))
 		}
+		if c.Polluter != nil {
+			evidence = append(evidence, fmt.Sprintf("polluter search used %d runs", c.Polluter.Probes))
+		}
 		if len(evidence) > 0 {
 			fmt.Printf("    %s\n", strings.Join(evidence, ", "))
 		}
@@ -302,8 +382,25 @@ func printReport(agg *Aggregate, causes []Cause, image string, env []string) {
 	for _, e := range env {
 		envFlags.WriteString(" -e " + e)
 	}
+	minimal := map[string]string{}
+	for _, c := range causes {
+		p := c.Polluter
+		switch {
+		case p == nil:
+		case p.FailsAlone:
+			minimal[c.Test] = p.VictimNode
+		case p.PolluterNode != "":
+			minimal[c.Test] = p.PolluterNode + " " + p.VictimNode
+		}
+	}
+
 	fmt.Println("\nReproduce (a trial where each flaky test failed):")
 	for _, s := range flaky {
+		if tests, ok := minimal[s.Name]; ok {
+			fmt.Printf("  %s\n    docker run --rm%s %s pytest -q -p no:cacheprovider --randomly-seed=%d --randomly-dont-reorganize %s\n",
+				s.Name, envFlags.String(), image, s.Failing[0].Seed, tests)
+			continue
+		}
 		t := s.Failing[0]
 		cpuFlag := ""
 		if t.CPUs > 0 {

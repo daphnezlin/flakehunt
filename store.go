@@ -53,6 +53,21 @@ var migrations = []string{
 	`
 	ALTER TABLE trials ADD COLUMN replay_for TEXT NOT NULL DEFAULT '';
 	`,
+	// 4: polluter search runs and what they found
+	`
+	ALTER TABLE trials ADD COLUMN probe TEXT NOT NULL DEFAULT '';
+	CREATE TABLE polluters (
+		run_id        INTEGER NOT NULL REFERENCES runs(id),
+		test          TEXT NOT NULL,
+		victim_node   TEXT NOT NULL,
+		fails_alone   INTEGER NOT NULL,
+		polluter      TEXT NOT NULL,
+		polluter_node TEXT NOT NULL,
+		note          TEXT NOT NULL,
+		probes        INTEGER NOT NULL,
+		PRIMARY KEY (run_id, test)
+	);
+	`,
 }
 
 type Store struct {
@@ -175,8 +190,8 @@ func (s *Store) SaveTrial(runID int64, res TrialResult) error {
 		status, errMsg = "error", res.Err.Error()
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO trials (run_id, trial_id, seed, cpus, cpuset, replay_for, status, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		runID, res.Trial.ID, res.Trial.Seed, res.Trial.CPUs, res.CPUSet, res.Trial.ReplayFor, status, errMsg,
+		`INSERT INTO trials (run_id, trial_id, seed, cpus, cpuset, replay_for, probe, status, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		runID, res.Trial.ID, res.Trial.Seed, res.Trial.CPUs, res.CPUSet, res.Trial.ReplayFor, res.Trial.Probe, status, errMsg,
 	); err != nil {
 		return err
 	}
@@ -279,7 +294,7 @@ func (s *Store) LoadAggregate(runID int64) (*Aggregate, error) {
 		return nil, err
 	}
 
-	rows, err = s.db.Query(`SELECT trial_id, test, outcome FROM results WHERE run_id = ?`, runID)
+	rows, err = s.db.Query(`SELECT trial_id, test, outcome FROM results WHERE run_id = ? ORDER BY rowid`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -310,7 +325,7 @@ func (s *Store) LoadReplays(runID int64) (map[string]*Count, error) {
 	rows, err := s.db.Query(`
 		SELECT t.replay_for, r.outcome
 		FROM trials t JOIN results r ON r.run_id = t.run_id AND r.trial_id = t.trial_id
-		WHERE t.run_id = ? AND t.replay_for != '' AND r.test = t.replay_for`, runID)
+		WHERE t.run_id = ? AND t.replay_for != '' AND t.probe = '' AND r.test = t.replay_for`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -336,4 +351,32 @@ func (s *Store) LoadReplays(runID int64) (map[string]*Count, error) {
 		}
 	}
 	return replays, rows.Err()
+}
+
+func (s *Store) SavePolluter(runID int64, test string, p PolluterResult) error {
+	_, err := s.db.Exec(`INSERT INTO polluters
+		(run_id, test, victim_node, fails_alone, polluter, polluter_node, note, probes)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		runID, test, p.VictimNode, p.FailsAlone, p.Polluter, p.PolluterNode, p.Note, p.Probes)
+	return err
+}
+
+func (s *Store) LoadPolluters(runID int64) (map[string]PolluterResult, error) {
+	rows, err := s.db.Query(`SELECT test, victim_node, fails_alone, polluter, polluter_node, note, probes
+		FROM polluters WHERE run_id = ?`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]PolluterResult{}
+	for rows.Next() {
+		var test string
+		var p PolluterResult
+		if err := rows.Scan(&test, &p.VictimNode, &p.FailsAlone, &p.Polluter, &p.PolluterNode, &p.Note, &p.Probes); err != nil {
+			return nil, err
+		}
+		out[test] = p
+	}
+	return out, rows.Err()
 }

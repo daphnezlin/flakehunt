@@ -13,7 +13,7 @@ func TestParseJUnitPytest(t *testing.T) {
 	xml := `<?xml version="1.0" encoding="utf-8"?>
 <testsuites><testsuite name="pytest" tests="3">
   <testcase classname="tests.test_order" name="test_no_users_initially"><failure message="assert"/></testcase>
-  <testcase classname="tests.test_stable" name="test_addition"/>
+  <testcase classname="tests.test_stable" name="test_addition" file="tests/test_stable.py" line="3"/>
   <testcase classname="tests.test_stable" name="test_skip"><skipped/></testcase>
 </testsuite></testsuites>`
 	got, err := ParseJUnit(strings.NewReader(xml))
@@ -26,24 +26,27 @@ func TestParseJUnitPytest(t *testing.T) {
 	if !got[0].Failed || got[0].Name != "tests.test_order::test_no_users_initially" {
 		t.Errorf("bad first case: %+v", got[0])
 	}
+	if got[1].NodeID != "tests/test_stable.py::test_addition" || got[0].NodeID != "" {
+		t.Errorf("node ids: %q %q", got[0].NodeID, got[1].NodeID)
+	}
 	if got[1].Failed || !got[2].Skip {
 		t.Errorf("bad flags: %+v %+v", got[1], got[2])
 	}
 }
 
 func TestWilson(t *testing.T) {
-	// Known value: 1 failure in 100 runs -> about 0.18% to 5.45%.
+	// 1/100 should be ~0.18% to 5.45%
 	low, high := Wilson(1, 100)
 	if math.Abs(low-0.0018) > 0.0005 || math.Abs(high-0.0545) > 0.0005 {
 		t.Errorf("Wilson(1,100) = %.4f, %.4f", low, high)
 	}
-	// Zero failures still gives a non-zero upper bound: "never failed" isn't proof of stability.
+	// 0 failures shouldn't mean 0 upper bound
 	if _, high := Wilson(0, 50); high <= 0 {
 		t.Errorf("upper bound for 0/50 should be > 0")
 	}
 }
 
-// fakeRunner fails "flaky" on odd seeds and tracks peak concurrency.
+// fails m::flaky on odd seeds, tracks max concurrency
 type fakeRunner struct{ running, peak atomic.Int32 }
 
 func (f *fakeRunner) Run(ctx context.Context, tr Trial) TrialResult {
