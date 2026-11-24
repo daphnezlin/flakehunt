@@ -7,6 +7,10 @@ type Trial struct {
 	ID   int
 	Seed int64   // pytest-randomly seed (controls order + random data)
 	CPUs float64 // cpu limit for this trial, 0 = no limit
+
+	// set on replay trials: the flaky test this rerun is checking.
+	// replays don't count towards failure rates
+	ReplayFor string
 }
 
 type TrialResult struct {

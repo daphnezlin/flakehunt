@@ -80,3 +80,41 @@ func TestStoreUnknownRun(t *testing.T) {
 		t.Error("expected error for missing run")
 	}
 }
+
+func TestReplaysKeptSeparate(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	runID, _ := store.CreateRun(RunInfo{StartedAt: time.Now(), Image: "zoo"})
+	store.SaveTrial(runID, TrialResult{Trial: Trial{ID: 1, Seed: 9},
+		Tests: []TestOutcome{{Name: "order", Failed: true}, {Name: "other"}}})
+	for i := 2; i <= 4; i++ {
+		store.SaveTrial(runID, TrialResult{Trial: Trial{ID: i, Seed: 9, ReplayFor: "order"},
+			Tests: []TestOutcome{{Name: "order", Failed: true}, {Name: "other"}}})
+	}
+
+	agg, err := store.LoadAggregate(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agg.Trials != 1 || agg.Tests["order"].Runs != 1 {
+		t.Errorf("replays leaked into rates: trials=%d runs=%d", agg.Trials, agg.Tests["order"].Runs)
+	}
+	replays, err := store.LoadReplays(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := replays["order"]; c == nil || c.Runs != 3 || c.Failures != 3 {
+		t.Errorf("replays: %+v", replays)
+	}
+	if _, ok := replays["other"]; ok {
+		t.Error("only the target test should count in a replay")
+	}
+	runs, _ := store.ListRuns()
+	if runs[0].Trials != 1 {
+		t.Errorf("run list should not count replays, got %d", runs[0].Trials)
+	}
+}

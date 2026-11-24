@@ -34,6 +34,7 @@ func runCmd() *cobra.Command {
 		runs      int
 		workers   int
 		cpuLevels []float64
+		replays   int
 		timeout   time.Duration
 		env       []string
 		outDir    string
@@ -85,7 +86,16 @@ func runCmd() *cobra.Command {
 				}
 				fmt.Fprintf(os.Stderr, "\r  %d/%d trials done", agg.Trials, runs)
 			}
-			fmt.Fprintf(os.Stderr, "\n  finished in %s\n\n", time.Since(start).Round(time.Second))
+			fmt.Fprintf(os.Stderr, "\n  finished in %s\n", time.Since(start).Round(time.Second))
+
+			var replayCounts map[string]*Count
+			if ctx.Err() == nil && replays > 0 {
+				replayCounts, err = runReplays(ctx, store, runID, runner, agg, replays, workers, len(trials))
+				if err != nil {
+					return err
+				}
+			}
+			fmt.Fprintln(os.Stderr)
 
 			if ctx.Err() != nil {
 				fmt.Fprintf(os.Stderr, "interrupted, run #%d has partial results\n\n", runID)
@@ -93,7 +103,7 @@ func runCmd() *cobra.Command {
 				return err
 			}
 
-			printReport(agg, image, env)
+			printReport(agg, Analyze(agg, replayCounts), image, env)
 			fmt.Printf("\nsaved as run #%d in %s (see it again with: flakehunt report %d)\n", runID, dbPath, runID)
 			return ctx.Err()
 		},
@@ -104,12 +114,63 @@ func runCmd() *cobra.Command {
 	f.IntVar(&runs, "runs", 50, "number of trials")
 	f.IntVar(&workers, "workers", max(1, runtime.NumCPU()/2), "trials running at once")
 	f.Float64SliceVar(&cpuLevels, "cpu-levels", []float64{0, 1, 0.5}, "CPU limits to spread across trials, 0 = no limit")
+	f.IntVar(&replays, "replays", 5, "reruns of each flaky test's failing seed, to check if the seed alone causes it (0 = off)")
 	f.DurationVar(&timeout, "timeout", 5*time.Minute, "per-trial timeout; longer runs count as hangs")
 	f.StringArrayVar(&env, "env", nil, "env var for every trial, KEY=VALUE (repeatable)")
 	f.StringVar(&outDir, "out", "flakehunt-out", "folder for per-trial results")
 	f.Int64Var(&baseSeed, "seed", time.Now().UnixNano(), "base seed for the campaign")
 	_ = cmd.MarkFlagRequired("image")
 	return cmd
+}
+
+// runReplays reruns each flaky test's first failing seed with no cpu limit.
+// If it fails every time, the seed (test order or random data) is enough to
+// cause it. If it sometimes passes, something else like timing is involved.
+func runReplays(ctx context.Context, store *Store, runID int64, runner Runner, agg *Aggregate,
+	per, workers, lastID int) (map[string]*Count, error) {
+
+	var trials []Trial
+	for _, s := range agg.Sorted() {
+		if !s.Flaky() {
+			continue
+		}
+		for i := 0; i < per; i++ {
+			lastID++
+			trials = append(trials, Trial{ID: lastID, Seed: s.Failing[0].Seed, ReplayFor: s.Name})
+		}
+	}
+	if len(trials) == 0 {
+		return nil, nil
+	}
+
+	fmt.Fprintf(os.Stderr, "  replaying failing seeds\n")
+	counts := map[string]*Count{}
+	done := 0
+	for res := range RunAll(ctx, runner, trials, workers) {
+		if err := store.SaveTrial(runID, res); err != nil {
+			return nil, fmt.Errorf("save replay %d: %w", res.Trial.ID, err)
+		}
+		done++
+		fmt.Fprintf(os.Stderr, "\r  %d/%d replays done", done, len(trials))
+
+		// same counting as Store.LoadReplays so live and saved reports match
+		for _, o := range res.Tests {
+			if o.Name != res.Trial.ReplayFor || o.Skip {
+				continue
+			}
+			c := counts[o.Name]
+			if c == nil {
+				c = &Count{}
+				counts[o.Name] = c
+			}
+			c.Runs++
+			if o.Failed {
+				c.Failures++
+			}
+		}
+	}
+	fmt.Fprintln(os.Stderr)
+	return counts, nil
 }
 
 func runsCmd() *cobra.Command {
@@ -172,15 +233,19 @@ func reportCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			replays, err := store.LoadReplays(runID)
+			if err != nil {
+				return err
+			}
 			fmt.Printf("run #%d, %s, %d trials, %d workers\n\n",
 				run.ID, run.StartedAt.Local().Format("2006-01-02 15:04"), agg.Trials, run.Workers)
-			printReport(agg, run.Image, run.Env)
+			printReport(agg, Analyze(agg, replays), run.Image, run.Env)
 			return nil
 		},
 	}
 }
 
-func printReport(agg *Aggregate, image string, env []string) {
+func printReport(agg *Aggregate, causes []Cause, image string, env []string) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "TEST\tFAILED\tRATE\t95% CI\tVERDICT")
 	var flaky []*TestStats
@@ -218,6 +283,21 @@ func printReport(agg *Aggregate, image string, env []string) {
 		fmt.Println()
 	}
 
+	fmt.Println("\nLikely causes:")
+	for _, c := range causes {
+		fmt.Printf("  %s\n    %s: %s\n", c.Test, c.Label, c.Detail)
+		var evidence []string
+		if c.CPUTested {
+			evidence = append(evidence, fmt.Sprintf("cpu trend p=%s (adjusted %s)", formatP(c.CPUp), formatP(c.CPUq)))
+		}
+		if c.Replays.Runs > 0 {
+			evidence = append(evidence, fmt.Sprintf("failing seed rerun %d/%d failed", c.Replays.Failures, c.Replays.Runs))
+		}
+		if len(evidence) > 0 {
+			fmt.Printf("    %s\n", strings.Join(evidence, ", "))
+		}
+	}
+
 	var envFlags strings.Builder
 	for _, e := range env {
 		envFlags.WriteString(" -e " + e)
@@ -233,6 +313,13 @@ func printReport(agg *Aggregate, image string, env []string) {
 			s.Name, cpuFlag, envFlags.String(), image, t.Seed)
 	}
 	fmt.Println("\nNote: a seed reproduces order and random data, not timing. Timing races may need several tries.")
+}
+
+func formatP(p float64) string {
+	if p < 0.001 {
+		return "<0.001"
+	}
+	return strconv.FormatFloat(p, 'f', 3, 64)
 }
 
 func formatLevel(l float64) string {
