@@ -3,43 +3,53 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
-const schema = `
-CREATE TABLE IF NOT EXISTS runs (
-	id          INTEGER PRIMARY KEY,
-	started_at  TEXT NOT NULL,
-	finished_at TEXT,
-	image       TEXT NOT NULL,
-	base_seed   INTEGER NOT NULL,
-	workers     INTEGER NOT NULL,
-	cpus        REAL NOT NULL,
-	env         TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS trials (
-	run_id   INTEGER NOT NULL REFERENCES runs(id),
-	trial_id INTEGER NOT NULL,
-	seed     INTEGER NOT NULL,
-	status   TEXT NOT NULL, -- ok, timeout, error
-	error    TEXT,
-	PRIMARY KEY (run_id, trial_id)
-);
-
-CREATE TABLE IF NOT EXISTS results (
-	run_id   INTEGER NOT NULL,
-	trial_id INTEGER NOT NULL,
-	test     TEXT NOT NULL,
-	outcome  TEXT NOT NULL, -- pass, fail, skip
-	FOREIGN KEY (run_id, trial_id) REFERENCES trials(run_id, trial_id)
-);
-
-CREATE INDEX IF NOT EXISTS results_by_test ON results(run_id, test);
-`
+// migrations run in order, once each. user_version in the db file tracks
+// how many have been applied, so old db files get upgraded instead of breaking.
+// never edit an old migration, add a new one.
+var migrations = []string{
+	// 1: initial schema
+	`
+	CREATE TABLE IF NOT EXISTS runs (
+		id          INTEGER PRIMARY KEY,
+		started_at  TEXT NOT NULL,
+		finished_at TEXT,
+		image       TEXT NOT NULL,
+		base_seed   INTEGER NOT NULL,
+		workers     INTEGER NOT NULL,
+		cpus        REAL NOT NULL,
+		env         TEXT NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS trials (
+		run_id   INTEGER NOT NULL REFERENCES runs(id),
+		trial_id INTEGER NOT NULL,
+		seed     INTEGER NOT NULL,
+		status   TEXT NOT NULL, -- ok, timeout, error
+		error    TEXT,
+		PRIMARY KEY (run_id, trial_id)
+	);
+	CREATE TABLE IF NOT EXISTS results (
+		run_id   INTEGER NOT NULL,
+		trial_id INTEGER NOT NULL,
+		test     TEXT NOT NULL,
+		outcome  TEXT NOT NULL, -- pass, fail, skip
+		FOREIGN KEY (run_id, trial_id) REFERENCES trials(run_id, trial_id)
+	);
+	CREATE INDEX IF NOT EXISTS results_by_test ON results(run_id, test);
+	`,
+	// 2: per-trial cpu limit and pinning. runs.cpus is unused from here on
+	`
+	ALTER TABLE runs ADD COLUMN cpu_levels TEXT NOT NULL DEFAULT '';
+	ALTER TABLE trials ADD COLUMN cpus REAL NOT NULL DEFAULT 0;
+	ALTER TABLE trials ADD COLUMN cpuset TEXT NOT NULL DEFAULT '';
+	`,
+}
 
 type Store struct {
 	db *sql.DB
@@ -52,7 +62,7 @@ type RunInfo struct {
 	Image     string
 	BaseSeed  int64
 	Workers   int
-	CPUs      float64
+	CPULevels []float64
 	Env       []string
 	Trials    int // only filled in by ListRuns
 }
@@ -65,21 +75,72 @@ func OpenStore(path string) (*Store, error) {
 	// only one goroutine writes anyway, and this avoids "database is locked"
 	db.SetMaxOpenConns(1)
 
-	for _, stmt := range []string{"PRAGMA journal_mode=WAL", "PRAGMA foreign_keys=ON", schema} {
+	for _, stmt := range []string{"PRAGMA journal_mode=WAL", "PRAGMA foreign_keys=ON"} {
 		if _, err := db.Exec(stmt); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("init db: %w", err)
 		}
 	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
+}
+
+func migrate(db *sql.DB) error {
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return err
+	}
+	for i := version; i < len(migrations); i++ {
+		tx, err := db.Begin()
+		if err != nil {
+			return err
+		}
+		// PRAGMA can't take ? params, i+1 is our own int so this is safe
+		if _, err := tx.Exec(migrations[i]); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("migration %d: %w", i+1, err)
+		}
+		if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", i+1)); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func joinFloats(fs []float64) string {
+	parts := make([]string, len(fs))
+	for i, f := range fs {
+		parts[i] = strconv.FormatFloat(f, 'g', -1, 64)
+	}
+	return strings.Join(parts, ",")
+}
+
+func splitFloats(s string) []float64 {
+	if s == "" {
+		return nil
+	}
+	var out []float64
+	for _, p := range strings.Split(s, ",") {
+		if f, err := strconv.ParseFloat(p, 64); err == nil {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) CreateRun(r RunInfo) (int64, error) {
 	res, err := s.db.Exec(
-		`INSERT INTO runs (started_at, image, base_seed, workers, cpus, env) VALUES (?, ?, ?, ?, ?, ?)`,
-		r.StartedAt.UTC().Format(time.RFC3339), r.Image, r.BaseSeed, r.Workers, r.CPUs, strings.Join(r.Env, "\n"),
+		`INSERT INTO runs (started_at, image, base_seed, workers, cpus, cpu_levels, env) VALUES (?, ?, ?, ?, 0, ?, ?)`,
+		r.StartedAt.UTC().Format(time.RFC3339), r.Image, r.BaseSeed, r.Workers, joinFloats(r.CPULevels), strings.Join(r.Env, "\n"),
 	)
 	if err != nil {
 		return 0, err
@@ -110,8 +171,8 @@ func (s *Store) SaveTrial(runID int64, res TrialResult) error {
 		status, errMsg = "error", res.Err.Error()
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO trials (run_id, trial_id, seed, status, error) VALUES (?, ?, ?, ?, ?)`,
-		runID, res.Trial.ID, res.Trial.Seed, status, errMsg,
+		`INSERT INTO trials (run_id, trial_id, seed, cpus, cpuset, status, error) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		runID, res.Trial.ID, res.Trial.Seed, res.Trial.CPUs, res.CPUSet, status, errMsg,
 	); err != nil {
 		return err
 	}
@@ -137,7 +198,7 @@ func (s *Store) SaveTrial(runID int64, res TrialResult) error {
 
 func (s *Store) ListRuns() ([]RunInfo, error) {
 	rows, err := s.db.Query(`
-		SELECT r.id, r.started_at, r.finished_at IS NOT NULL, r.image, r.workers, r.cpus, COUNT(t.trial_id)
+		SELECT r.id, r.started_at, r.finished_at IS NOT NULL, r.image, r.workers, r.cpu_levels, COUNT(t.trial_id)
 		FROM runs r LEFT JOIN trials t ON t.run_id = r.id
 		GROUP BY r.id ORDER BY r.id`)
 	if err != nil {
@@ -148,11 +209,12 @@ func (s *Store) ListRuns() ([]RunInfo, error) {
 	var runs []RunInfo
 	for rows.Next() {
 		var r RunInfo
-		var started string
-		if err := rows.Scan(&r.ID, &started, &r.Finished, &r.Image, &r.Workers, &r.CPUs, &r.Trials); err != nil {
+		var started, levels string
+		if err := rows.Scan(&r.ID, &started, &r.Finished, &r.Image, &r.Workers, &levels, &r.Trials); err != nil {
 			return nil, err
 		}
 		r.StartedAt, _ = time.Parse(time.RFC3339, started)
+		r.CPULevels = splitFloats(levels)
 		runs = append(runs, r)
 	}
 	return runs, rows.Err()
@@ -160,10 +222,10 @@ func (s *Store) ListRuns() ([]RunInfo, error) {
 
 func (s *Store) GetRun(runID int64) (RunInfo, error) {
 	var r RunInfo
-	var started, env string
+	var started, levels, env string
 	err := s.db.QueryRow(
-		`SELECT id, started_at, finished_at IS NOT NULL, image, base_seed, workers, cpus, env FROM runs WHERE id = ?`, runID,
-	).Scan(&r.ID, &started, &r.Finished, &r.Image, &r.BaseSeed, &r.Workers, &r.CPUs, &env)
+		`SELECT id, started_at, finished_at IS NOT NULL, image, base_seed, workers, cpu_levels, env FROM runs WHERE id = ?`, runID,
+	).Scan(&r.ID, &started, &r.Finished, &r.Image, &r.BaseSeed, &r.Workers, &levels, &env)
 	if err == sql.ErrNoRows {
 		return r, fmt.Errorf("no run with id %d", runID)
 	}
@@ -171,6 +233,7 @@ func (s *Store) GetRun(runID int64) (RunInfo, error) {
 		return r, err
 	}
 	r.StartedAt, _ = time.Parse(time.RFC3339, started)
+	r.CPULevels = splitFloats(levels)
 	if env != "" {
 		r.Env = strings.Split(env, "\n")
 	}
@@ -183,20 +246,21 @@ func (s *Store) LoadAggregate(runID int64) (*Aggregate, error) {
 	trials := map[int]*TrialResult{}
 	var order []int
 
-	rows, err := s.db.Query(`SELECT trial_id, seed, status, error FROM trials WHERE run_id = ? ORDER BY trial_id`, runID)
+	rows, err := s.db.Query(`SELECT trial_id, seed, cpus, cpuset, status, error FROM trials WHERE run_id = ? ORDER BY trial_id`, runID)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var id int
 		var seed int64
-		var status string
+		var cpus float64
+		var cpuset, status string
 		var errMsg sql.NullString
-		if err := rows.Scan(&id, &seed, &status, &errMsg); err != nil {
+		if err := rows.Scan(&id, &seed, &cpus, &cpuset, &status, &errMsg); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		tr := &TrialResult{Trial: Trial{ID: id, Seed: seed}}
+		tr := &TrialResult{Trial: Trial{ID: id, Seed: seed, CPUs: cpus}, CPUSet: cpuset}
 		switch status {
 		case "timeout":
 			tr.TimedOut = true

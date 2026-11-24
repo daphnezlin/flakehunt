@@ -2,23 +2,22 @@ package main
 
 import "context"
 
-// Trial is one run of the test suite under one set of conditions.
+// Trial is one run of the suite.
 type Trial struct {
 	ID   int
-	Seed int64 // passed to pytest-randomly, so the run's order and random data are reproducible
+	Seed int64   // pytest-randomly seed (controls order + random data)
+	CPUs float64 // cpu limit for this trial, 0 = no limit
 }
 
-// TrialResult is what came back from one trial.
 type TrialResult struct {
 	Trial    Trial
+	CPUSet   string // cores the trial was pinned to, "" if not pinned
 	Tests    []TestOutcome
 	TimedOut bool
-	Err      error // infrastructure problem (couldn't start, no results file): NOT a test failure
+	Err      error // infra problem, not a test failure
 }
 
-// Runner executes a trial somewhere. Phase 1-3: Docker. Phase 4+: Kubernetes.
-// The orchestrator only depends on this interface, so adding a backend
-// never changes the scheduling or analysis code.
+// Runner runs a trial. Docker for now, k8s later.
 type Runner interface {
 	Run(ctx context.Context, t Trial) TrialResult
 }

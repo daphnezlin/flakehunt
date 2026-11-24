@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"os"
 	"os/signal"
 	"runtime"
@@ -31,14 +30,14 @@ func main() {
 
 func runCmd() *cobra.Command {
 	var (
-		image    string
-		runs     int
-		workers  int
-		cpus     float64
-		timeout  time.Duration
-		env      []string
-		outDir   string
-		baseSeed int64
+		image     string
+		runs      int
+		workers   int
+		cpuLevels []float64
+		timeout   time.Duration
+		env       []string
+		outDir    string
+		baseSeed  int64
 	)
 
 	cmd := &cobra.Command{
@@ -54,28 +53,24 @@ func runCmd() *cobra.Command {
 			}
 			defer store.Close()
 
-			runner, err := NewDockerRunner(image, outDir, env, cpus, timeout)
+			runner, err := NewDockerRunner(ctx, image, outDir, env, workers, timeout)
 			if err != nil {
 				return err
 			}
 
 			runID, err := store.CreateRun(RunInfo{
 				StartedAt: time.Now(), Image: image, BaseSeed: baseSeed,
-				Workers: workers, CPUs: cpus, Env: env,
+				Workers: workers, CPULevels: cpuLevels, Env: env,
 			})
 			if err != nil {
 				return fmt.Errorf("save run: %w", err)
 			}
 
-			// derive seeds from one base seed so a whole run is reproducible
-			rng := rand.New(rand.NewSource(baseSeed))
-			trials := make([]Trial, runs)
-			for i := range trials {
-				trials[i] = Trial{ID: i + 1, Seed: rng.Int63n(1 << 31)}
-			}
+			// everything comes from one base seed so a whole run is reproducible
+			trials := MakeTrials(runs, cpuLevels, baseSeed)
 
-			fmt.Fprintf(os.Stderr, "run #%d: %d trials of %s with %d workers (base seed %d)\n",
-				runID, runs, image, workers, baseSeed)
+			fmt.Fprintf(os.Stderr, "run #%d: %d trials of %s with %d workers, cpu levels %s (base seed %d)\n",
+				runID, runs, image, workers, formatLevels(cpuLevels), baseSeed)
 			start := time.Now()
 
 			// results are only handled here, so this loop is the single db writer
@@ -108,7 +103,7 @@ func runCmd() *cobra.Command {
 	f.StringVar(&image, "image", "", "Docker image containing the project and its tests (required)")
 	f.IntVar(&runs, "runs", 50, "number of trials")
 	f.IntVar(&workers, "workers", max(1, runtime.NumCPU()/2), "trials running at once")
-	f.Float64Var(&cpus, "cpus", 0, "CPU limit per trial, e.g. 0.5 (0 = unlimited)")
+	f.Float64SliceVar(&cpuLevels, "cpu-levels", []float64{0, 1, 0.5}, "CPU limits to spread across trials, 0 = no limit")
 	f.DurationVar(&timeout, "timeout", 5*time.Minute, "per-trial timeout; longer runs count as hangs")
 	f.StringArrayVar(&env, "env", nil, "env var for every trial, KEY=VALUE (repeatable)")
 	f.StringVar(&outDir, "out", "flakehunt-out", "folder for per-trial results")
@@ -137,18 +132,15 @@ func runsCmd() *cobra.Command {
 				return nil
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "ID\tSTARTED\tIMAGE\tTRIALS\tWORKERS\tCPUS\tSTATUS")
+			fmt.Fprintln(w, "ID\tSTARTED\tIMAGE\tTRIALS\tWORKERS\tCPU LEVELS\tSTATUS")
 			for _, r := range runs {
 				status := "done"
 				if !r.Finished {
 					status = "incomplete"
 				}
-				cpus := "-"
-				if r.CPUs > 0 {
-					cpus = strconv.FormatFloat(r.CPUs, 'g', -1, 64)
-				}
 				fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%d\t%s\t%s\n",
-					r.ID, r.StartedAt.Local().Format("2006-01-02 15:04"), r.Image, r.Trials, r.Workers, cpus, status)
+					r.ID, r.StartedAt.Local().Format("2006-01-02 15:04"), r.Image, r.Trials, r.Workers,
+					formatLevels(r.CPULevels), status)
 			}
 			return w.Flush()
 		},
@@ -216,14 +208,47 @@ func printReport(agg *Aggregate, image string, env []string) {
 		fmt.Println("\nNo flaky tests found.")
 		return
 	}
+	fmt.Println("\nFailure rate by CPU limit:")
+	for _, s := range flaky {
+		fmt.Printf("  %s\n   ", s.Name)
+		for _, l := range s.CPULevels() {
+			c := s.ByCPU[l]
+			fmt.Printf("  %s: %d/%d (%.0f%%)", formatLevel(l), c.Failures, c.Runs, 100*c.Rate())
+		}
+		fmt.Println()
+	}
+
 	var envFlags strings.Builder
 	for _, e := range env {
 		envFlags.WriteString(" -e " + e)
 	}
-	fmt.Println("\nReproduce (a seed where each flaky test failed):")
+	fmt.Println("\nReproduce (a trial where each flaky test failed):")
 	for _, s := range flaky {
-		fmt.Printf("  %s\n    docker run --rm%s %s pytest -q -p no:cacheprovider --randomly-seed=%d\n",
-			s.Name, envFlags.String(), image, s.FailingSeeds[0])
+		t := s.Failing[0]
+		cpuFlag := ""
+		if t.CPUs > 0 {
+			cpuFlag = " --cpus " + formatLevel(t.CPUs)
+		}
+		fmt.Printf("  %s\n    docker run --rm%s%s %s pytest -q -p no:cacheprovider --randomly-seed=%d\n",
+			s.Name, cpuFlag, envFlags.String(), image, t.Seed)
 	}
 	fmt.Println("\nNote: a seed reproduces order and random data, not timing. Timing races may need several tries.")
+}
+
+func formatLevel(l float64) string {
+	if l == 0 {
+		return "no limit"
+	}
+	return strconv.FormatFloat(l, 'g', -1, 64)
+}
+
+func formatLevels(ls []float64) string {
+	if len(ls) == 0 {
+		return "-"
+	}
+	parts := make([]string, len(ls))
+	for i, l := range ls {
+		parts[i] = formatLevel(l)
+	}
+	return strings.Join(parts, ", ")
 }
