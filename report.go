@@ -45,7 +45,7 @@ func reproFor(s *TestStats, c *Cause, image string, env []string) repro {
 		cpuFlag = " --cpus " + formatLevel(t.CPUs)
 	}
 	r := repro{Cmd: fmt.Sprintf(base, cpuFlag)}
-	if t.LatencyMS > 0 {
+	if t.LatencyMS > 0 && c != nil && c.NetTested && c.NetQ < alpha {
 		r.Note = fmt.Sprintf("failed with %dms latency to the service, which docker run alone won't add: "+
 			"rerun flakehunt with --latency-levels %d to reproduce", t.LatencyMS, t.LatencyMS)
 	}
