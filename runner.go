@@ -4,9 +4,10 @@ import "context"
 
 // Trial is one run of the suite.
 type Trial struct {
-	ID   int
-	Seed int64   // pytest-randomly seed (controls order + random data)
-	CPUs float64 // cpu limit for this trial, 0 = no limit
+	ID        int
+	Seed      int64   // pytest-randomly seed (controls order + random data)
+	CPUs      float64 // cpu limit for this trial, 0 = no limit
+	LatencyMS int     // network latency added to the service, 0 = none
 
 	// set on replay and probe trials: the flaky test this rerun is checking.
 	// these don't count towards failure rates

@@ -34,6 +34,10 @@ func runCmd() *cobra.Command {
 		runs      int
 		workers   int
 		cpuLevels []float64
+		latencies []int
+		svc       ServiceConfig
+		svcCmd    string
+		toxiImage string
 		replays   int
 		polluters bool
 		timeout   time.Duration
@@ -55,24 +59,41 @@ func runCmd() *cobra.Command {
 			}
 			defer store.Close()
 
-			runner, err := NewDockerRunner(ctx, image, outDir, env, workers, timeout)
+			var service *ServiceConfig
+			if svc.Image != "" {
+				svc.Cmd = strings.Fields(svcCmd)
+				service = &svc
+			} else {
+				for _, l := range latencies {
+					if l != 0 {
+						return fmt.Errorf("--latency-levels needs --service-image: latency is added between the tests and a service")
+					}
+				}
+				latencies = nil
+			}
+
+			runner, err := NewDockerRunner(ctx, image, outDir, env, workers, timeout, service, toxiImage)
 			if err != nil {
 				return err
 			}
 
 			runID, err := store.CreateRun(RunInfo{
-				StartedAt: time.Now(), Image: image, BaseSeed: baseSeed,
-				Workers: workers, CPULevels: cpuLevels, Env: env,
+				StartedAt: time.Now(), Image: image, BaseSeed: baseSeed, Workers: workers,
+				CPULevels: cpuLevels, LatencyLevels: latencies, Service: svc.Image, Env: env,
 			})
 			if err != nil {
 				return fmt.Errorf("save run: %w", err)
 			}
 
 			// everything comes from one base seed so a whole run is reproducible
-			trials := MakeTrials(runs, cpuLevels, baseSeed)
+			trials := MakeTrials(runs, cpuLevels, latencies, baseSeed)
 
-			fmt.Fprintf(os.Stderr, "run #%d: %d trials of %s with %d workers, cpu levels %s (base seed %d)\n",
-				runID, runs, image, workers, formatLevels(cpuLevels), baseSeed)
+			fmt.Fprintf(os.Stderr, "run #%d: %d trials of %s with %d workers, cpu levels %s",
+				runID, runs, image, workers, formatLevels(cpuLevels))
+			if service != nil {
+				fmt.Fprintf(os.Stderr, ", latency %s (service %s)", formatLatencies(latencies), svc.Image)
+			}
+			fmt.Fprintf(os.Stderr, " (base seed %d)\n", baseSeed)
 			start := time.Now()
 
 			// results are only handled here, so this loop is the single db writer
@@ -124,6 +145,13 @@ func runCmd() *cobra.Command {
 	f.IntVar(&runs, "runs", 50, "number of trials")
 	f.IntVar(&workers, "workers", max(1, runtime.NumCPU()/2), "trials running at once")
 	f.Float64SliceVar(&cpuLevels, "cpu-levels", []float64{0, 1, 0.5}, "CPU limits to spread across trials, 0 = no limit")
+	f.IntSliceVar(&latencies, "latency-levels", []int{0, 50, 150}, "network latency in ms added to the service, spread across trials (needs --service-image)")
+	f.StringVar(&svc.Image, "service-image", "", "image for a service the tests talk to, e.g. an api or database")
+	f.StringVar(&svcCmd, "service-cmd", "", "command for the service container (split on spaces, no quoting)")
+	f.IntVar(&svc.Port, "service-port", 0, "port the service listens on")
+	f.StringVar(&svc.Health, "service-health", "", "shell command that succeeds once the service is ready")
+	f.StringArrayVar(&svc.Env, "service-env", nil, "env var telling tests where the service is, {addr} becomes host:port (repeatable)")
+	f.StringVar(&toxiImage, "toxiproxy-image", "ghcr.io/shopify/toxiproxy:2.13.0", "toxiproxy image used to add latency")
 	f.IntVar(&replays, "replays", 5, "reruns of each flaky test's failing seed, to check if the seed alone causes it (0 = off)")
 	f.BoolVar(&polluters, "find-polluters", true, "for seed-dependent tests, check if they fail alone and find which earlier test breaks them")
 	f.DurationVar(&timeout, "timeout", 5*time.Minute, "per-trial timeout; longer runs count as hangs")
@@ -266,15 +294,15 @@ func runsCmd() *cobra.Command {
 				return nil
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "ID\tSTARTED\tIMAGE\tTRIALS\tWORKERS\tCPU LEVELS\tSTATUS")
+			fmt.Fprintln(w, "ID\tSTARTED\tIMAGE\tTRIALS\tWORKERS\tCPU LEVELS\tLATENCY\tSTATUS")
 			for _, r := range runs {
 				status := "done"
 				if !r.Finished {
 					status = "incomplete"
 				}
-				fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%d\t%s\t%s\n",
+				fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%d\t%s\t%s\t%s\n",
 					r.ID, r.StartedAt.Local().Format("2006-01-02 15:04"), r.Image, r.Trials, r.Workers,
-					formatLevels(r.CPULevels), status)
+					formatLevels(r.CPULevels), formatLatencies(r.LatencyLevels), status)
 			}
 			return w.Flush()
 		},
@@ -360,12 +388,33 @@ func printReport(agg *Aggregate, causes []Cause, image string, env []string) {
 		fmt.Println()
 	}
 
+	showLatency := false
+	for _, s := range flaky {
+		if len(s.ByLatency) > 1 {
+			showLatency = true
+		}
+	}
+	if showLatency {
+		fmt.Println("\nFailure rate by network latency:")
+		for _, s := range flaky {
+			fmt.Printf("  %s\n   ", s.Name)
+			for _, l := range s.LatencyLevels() {
+				c := s.ByLatency[l]
+				fmt.Printf("  %s: %d/%d (%.0f%%)", formatLatency(int(l)), c.Failures, c.Runs, 100*c.Rate())
+			}
+			fmt.Println()
+		}
+	}
+
 	fmt.Println("\nLikely causes:")
 	for _, c := range causes {
 		fmt.Printf("  %s\n    %s: %s\n", c.Test, c.Label, c.Detail)
 		var evidence []string
 		if c.CPUTested {
 			evidence = append(evidence, fmt.Sprintf("cpu trend p=%s (adjusted %s)", formatP(c.CPUp), formatP(c.CPUq)))
+		}
+		if c.NetTested {
+			evidence = append(evidence, fmt.Sprintf("latency trend p=%s (adjusted %s)", formatP(c.NetP), formatP(c.NetQ)))
 		}
 		if c.Replays.Runs > 0 {
 			evidence = append(evidence, fmt.Sprintf("failing seed rerun %d/%d failed", c.Replays.Failures, c.Replays.Runs))
@@ -408,6 +457,10 @@ func printReport(agg *Aggregate, causes []Cause, image string, env []string) {
 		}
 		fmt.Printf("  %s\n    docker run --rm%s%s %s pytest -q -p no:cacheprovider --randomly-seed=%d\n",
 			s.Name, cpuFlag, envFlags.String(), image, t.Seed)
+		if t.LatencyMS > 0 {
+			fmt.Printf("    (failed with %dms latency to the service, which docker run alone won't add:\n"+
+				"     rerun flakehunt with --latency-levels %d to reproduce)\n", t.LatencyMS, t.LatencyMS)
+		}
 	}
 	fmt.Println("\nNote: a seed reproduces order and random data, not timing. Timing races may need several tries.")
 }
@@ -424,6 +477,24 @@ func formatLevel(l float64) string {
 		return "no limit"
 	}
 	return strconv.FormatFloat(l, 'g', -1, 64)
+}
+
+func formatLatency(ms int) string {
+	if ms == 0 {
+		return "none"
+	}
+	return fmt.Sprintf("%d+/-%dms", ms, Jitter(ms))
+}
+
+func formatLatencies(ls []int) string {
+	if len(ls) == 0 {
+		return "-"
+	}
+	parts := make([]string, len(ls))
+	for i, l := range ls {
+		parts[i] = formatLatency(l)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func formatLevels(ls []float64) string {

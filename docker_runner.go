@@ -20,9 +20,13 @@ type DockerRunner struct {
 	env     []string // passed to every trial
 	timeout time.Duration
 	slots   chan string // free cpusets, nil if pinning is off
+
+	service        *ServiceConfig // nil = no service, no network faults
+	toxiproxyImage string
 }
 
-func NewDockerRunner(ctx context.Context, image, outDir string, env []string, workers int, timeout time.Duration) (*DockerRunner, error) {
+func NewDockerRunner(ctx context.Context, image, outDir string, env []string, workers int, timeout time.Duration,
+	service *ServiceConfig, toxiproxyImage string) (*DockerRunner, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, fmt.Errorf("connect to docker: %w", err)
@@ -31,7 +35,17 @@ func NewDockerRunner(ctx context.Context, image, outDir string, env []string, wo
 	if err != nil {
 		return nil, err
 	}
-	d := &DockerRunner{cli: cli, image: image, outDir: abs, env: env, timeout: timeout}
+	d := &DockerRunner{cli: cli, image: image, outDir: abs, env: env, timeout: timeout,
+		service: service, toxiproxyImage: toxiproxyImage}
+
+	if service != nil {
+		// pull up front so the first trials don't all try to pull at once
+		for _, ref := range []string{service.Image, toxiproxyImage} {
+			if err := ensureImage(ctx, cli, ref); err != nil {
+				return nil, err
+			}
+		}
+	}
 
 	// pin each worker to its own cores so trials don't slow each other down.
 	// NCPU is what the docker VM has, which can be less than the host.
@@ -72,6 +86,7 @@ func (d *DockerRunner) Run(ctx context.Context, t Trial) TrialResult {
 	_ = os.Chmod(trialDir, 0o777)
 
 	cmd := PytestArgs(t, "/results/junit.xml")
+	env := d.env
 
 	hostCfg := &container.HostConfig{Binds: []string{trialDir + ":/results"}}
 	hostCfg.Resources.CpusetCpus = res.CPUSet
@@ -79,8 +94,21 @@ func (d *DockerRunner) Run(ctx context.Context, t Trial) TrialResult {
 		hostCfg.Resources.NanoCPUs = int64(t.CPUs * 1e9)
 	}
 
+	// the service and toxiproxy aren't pinned or cpu limited: they're the
+	// network side, only the test container is what we're varying
+	if d.service != nil {
+		netName, svcEnv, cleanup, err := d.startService(ctx, t)
+		defer cleanup()
+		if err != nil {
+			res.Err = fmt.Errorf("service setup: %w", err)
+			return res
+		}
+		env = append(append([]string{}, env...), svcEnv...)
+		hostCfg.NetworkMode = container.NetworkMode(netName)
+	}
+
 	created, err := d.cli.ContainerCreate(ctx,
-		&container.Config{Image: d.image, Cmd: cmd, Env: d.env},
+		&container.Config{Image: d.image, Cmd: cmd, Env: env, Labels: labels},
 		hostCfg, nil, nil, "")
 	if err != nil {
 		res.Err = fmt.Errorf("create container: %w", err)

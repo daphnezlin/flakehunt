@@ -26,7 +26,7 @@ func TestCPUSets(t *testing.T) {
 }
 
 func TestMakeTrialsBalanced(t *testing.T) {
-	trials := MakeTrials(30, []float64{0, 1, 0.5}, 7)
+	trials := MakeTrials(30, []float64{0, 1, 0.5}, nil, 7)
 	counts := map[float64]int{}
 	for i, tr := range trials {
 		counts[tr.CPUs]++
@@ -40,7 +40,7 @@ func TestMakeTrialsBalanced(t *testing.T) {
 		}
 	}
 	// same base seed, same run
-	if !reflect.DeepEqual(trials, MakeTrials(30, []float64{0, 1, 0.5}, 7)) {
+	if !reflect.DeepEqual(trials, MakeTrials(30, []float64{0, 1, 0.5}, nil, 7)) {
 		t.Error("MakeTrials isn't reproducible from the base seed")
 	}
 }
@@ -117,5 +117,44 @@ func TestMigratesOldDB(t *testing.T) {
 	store.db.QueryRow("PRAGMA user_version").Scan(&version)
 	if version != len(migrations) {
 		t.Errorf("user_version = %d, want %d", version, len(migrations))
+	}
+}
+
+func TestMakeTrialsBalancesCombinations(t *testing.T) {
+	trials := MakeTrials(90, []float64{0, 1, 0.5}, []int{0, 50, 150}, 3)
+	combos := map[[2]float64]int{}
+	for _, tr := range trials {
+		combos[[2]float64{tr.CPUs, float64(tr.LatencyMS)}]++
+	}
+	if len(combos) != 9 {
+		t.Fatalf("want 9 combinations, got %d", len(combos))
+	}
+	for k, n := range combos {
+		if n != 10 {
+			t.Errorf("combination %v got %d trials, want 10", k, n)
+		}
+	}
+}
+
+func TestStoreSavesLatency(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	runID, _ := store.CreateRun(RunInfo{StartedAt: time.Now(), Image: "zoo", LatencyLevels: []int{0, 150}, Service: "api"})
+	store.SaveTrial(runID, TrialResult{Trial: Trial{ID: 1, LatencyMS: 150}, Tests: []TestOutcome{{Name: "api", Failed: true}}})
+
+	agg, err := store.LoadAggregate(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := agg.Tests["api"].ByLatency[150]; c == nil || c.Failures != 1 {
+		t.Errorf("latency not loaded back: %+v", agg.Tests["api"].ByLatency)
+	}
+	run, _ := store.GetRun(runID)
+	if !reflect.DeepEqual(run.LatencyLevels, []int{0, 150}) || run.Service != "api" {
+		t.Errorf("run: %+v", run)
 	}
 }

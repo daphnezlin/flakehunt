@@ -68,6 +68,12 @@ var migrations = []string{
 		PRIMARY KEY (run_id, test)
 	);
 	`,
+	// 5: network latency per trial
+	`
+	ALTER TABLE runs ADD COLUMN latency_levels TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN service TEXT NOT NULL DEFAULT '';
+	ALTER TABLE trials ADD COLUMN latency_ms INTEGER NOT NULL DEFAULT 0;
+	`,
 }
 
 type Store struct {
@@ -75,15 +81,17 @@ type Store struct {
 }
 
 type RunInfo struct {
-	ID        int64
-	StartedAt time.Time
-	Finished  bool
-	Image     string
-	BaseSeed  int64
-	Workers   int
-	CPULevels []float64
-	Env       []string
-	Trials    int // only filled in by ListRuns
+	ID            int64
+	StartedAt     time.Time
+	Finished      bool
+	Image         string
+	BaseSeed      int64
+	Workers       int
+	CPULevels     []float64
+	LatencyLevels []int
+	Service       string // service image, "" if none
+	Env           []string
+	Trials        int // only filled in by ListRuns
 }
 
 func OpenStore(path string) (*Store, error) {
@@ -141,6 +149,22 @@ func joinFloats(fs []float64) string {
 	return strings.Join(parts, ",")
 }
 
+func intsToFloats(is []int) []float64 {
+	out := make([]float64, len(is))
+	for i, v := range is {
+		out[i] = float64(v)
+	}
+	return out
+}
+
+func floatsToInts(fs []float64) []int {
+	out := make([]int, len(fs))
+	for i, v := range fs {
+		out[i] = int(v)
+	}
+	return out
+}
+
 func splitFloats(s string) []float64 {
 	if s == "" {
 		return nil
@@ -158,8 +182,10 @@ func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) CreateRun(r RunInfo) (int64, error) {
 	res, err := s.db.Exec(
-		`INSERT INTO runs (started_at, image, base_seed, workers, cpus, cpu_levels, env) VALUES (?, ?, ?, ?, 0, ?, ?)`,
-		r.StartedAt.UTC().Format(time.RFC3339), r.Image, r.BaseSeed, r.Workers, joinFloats(r.CPULevels), strings.Join(r.Env, "\n"),
+		`INSERT INTO runs (started_at, image, base_seed, workers, cpus, cpu_levels, latency_levels, service, env)
+		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)`,
+		r.StartedAt.UTC().Format(time.RFC3339), r.Image, r.BaseSeed, r.Workers, joinFloats(r.CPULevels),
+		joinFloats(intsToFloats(r.LatencyLevels)), r.Service, strings.Join(r.Env, "\n"),
 	)
 	if err != nil {
 		return 0, err
@@ -190,8 +216,10 @@ func (s *Store) SaveTrial(runID int64, res TrialResult) error {
 		status, errMsg = "error", res.Err.Error()
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO trials (run_id, trial_id, seed, cpus, cpuset, replay_for, probe, status, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		runID, res.Trial.ID, res.Trial.Seed, res.Trial.CPUs, res.CPUSet, res.Trial.ReplayFor, res.Trial.Probe, status, errMsg,
+		`INSERT INTO trials (run_id, trial_id, seed, cpus, latency_ms, cpuset, replay_for, probe, status, error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		runID, res.Trial.ID, res.Trial.Seed, res.Trial.CPUs, res.Trial.LatencyMS, res.CPUSet,
+		res.Trial.ReplayFor, res.Trial.Probe, status, errMsg,
 	); err != nil {
 		return err
 	}
@@ -217,7 +245,8 @@ func (s *Store) SaveTrial(runID int64, res TrialResult) error {
 
 func (s *Store) ListRuns() ([]RunInfo, error) {
 	rows, err := s.db.Query(`
-		SELECT r.id, r.started_at, r.finished_at IS NOT NULL, r.image, r.workers, r.cpu_levels, COUNT(CASE WHEN t.replay_for = '' THEN 1 END)
+		SELECT r.id, r.started_at, r.finished_at IS NOT NULL, r.image, r.workers, r.cpu_levels, r.latency_levels,
+			COUNT(CASE WHEN t.replay_for = '' THEN 1 END)
 		FROM runs r LEFT JOIN trials t ON t.run_id = r.id
 		GROUP BY r.id ORDER BY r.id`)
 	if err != nil {
@@ -228,12 +257,13 @@ func (s *Store) ListRuns() ([]RunInfo, error) {
 	var runs []RunInfo
 	for rows.Next() {
 		var r RunInfo
-		var started, levels string
-		if err := rows.Scan(&r.ID, &started, &r.Finished, &r.Image, &r.Workers, &levels, &r.Trials); err != nil {
+		var started, levels, latencies string
+		if err := rows.Scan(&r.ID, &started, &r.Finished, &r.Image, &r.Workers, &levels, &latencies, &r.Trials); err != nil {
 			return nil, err
 		}
 		r.StartedAt, _ = time.Parse(time.RFC3339, started)
 		r.CPULevels = splitFloats(levels)
+		r.LatencyLevels = floatsToInts(splitFloats(latencies))
 		runs = append(runs, r)
 	}
 	return runs, rows.Err()
@@ -241,10 +271,11 @@ func (s *Store) ListRuns() ([]RunInfo, error) {
 
 func (s *Store) GetRun(runID int64) (RunInfo, error) {
 	var r RunInfo
-	var started, levels, env string
+	var started, levels, latencies, env string
 	err := s.db.QueryRow(
-		`SELECT id, started_at, finished_at IS NOT NULL, image, base_seed, workers, cpu_levels, env FROM runs WHERE id = ?`, runID,
-	).Scan(&r.ID, &started, &r.Finished, &r.Image, &r.BaseSeed, &r.Workers, &levels, &env)
+		`SELECT id, started_at, finished_at IS NOT NULL, image, base_seed, workers, cpu_levels, latency_levels, service, env
+		FROM runs WHERE id = ?`, runID,
+	).Scan(&r.ID, &started, &r.Finished, &r.Image, &r.BaseSeed, &r.Workers, &levels, &latencies, &r.Service, &env)
 	if err == sql.ErrNoRows {
 		return r, fmt.Errorf("no run with id %d", runID)
 	}
@@ -253,6 +284,7 @@ func (s *Store) GetRun(runID int64) (RunInfo, error) {
 	}
 	r.StartedAt, _ = time.Parse(time.RFC3339, started)
 	r.CPULevels = splitFloats(levels)
+	r.LatencyLevels = floatsToInts(splitFloats(latencies))
 	if env != "" {
 		r.Env = strings.Split(env, "\n")
 	}
@@ -265,7 +297,7 @@ func (s *Store) LoadAggregate(runID int64) (*Aggregate, error) {
 	trials := map[int]*TrialResult{}
 	var order []int
 
-	rows, err := s.db.Query(`SELECT trial_id, seed, cpus, cpuset, status, error FROM trials WHERE run_id = ? AND replay_for = '' ORDER BY trial_id`, runID)
+	rows, err := s.db.Query(`SELECT trial_id, seed, cpus, latency_ms, cpuset, status, error FROM trials WHERE run_id = ? AND replay_for = '' ORDER BY trial_id`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -273,13 +305,14 @@ func (s *Store) LoadAggregate(runID int64) (*Aggregate, error) {
 		var id int
 		var seed int64
 		var cpus float64
+		var latency int
 		var cpuset, status string
 		var errMsg sql.NullString
-		if err := rows.Scan(&id, &seed, &cpus, &cpuset, &status, &errMsg); err != nil {
+		if err := rows.Scan(&id, &seed, &cpus, &latency, &cpuset, &status, &errMsg); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		tr := &TrialResult{Trial: Trial{ID: id, Seed: seed, CPUs: cpus}, CPUSet: cpuset}
+		tr := &TrialResult{Trial: Trial{ID: id, Seed: seed, CPUs: cpus, LatencyMS: latency}, CPUSet: cpuset}
 		switch status {
 		case "timeout":
 			tr.TimedOut = true
