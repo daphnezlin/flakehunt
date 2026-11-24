@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -14,12 +15,15 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var dbPath string
+
 func main() {
 	root := &cobra.Command{
 		Use:   "flakehunt",
 		Short: "Find flaky tests by running a suite many times under controlled conditions",
 	}
-	root.AddCommand(runCmd())
+	root.PersistentFlags().StringVar(&dbPath, "db", "flakehunt.db", "SQLite file where runs are saved")
+	root.AddCommand(runCmd(), runsCmd(), reportCmd())
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
 	}
@@ -41,28 +45,45 @@ func runCmd() *cobra.Command {
 		Use:   "run",
 		Short: "Run the test suite in parallel containers and report flaky tests",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Ctrl+C cancels in-flight trials cleanly instead of leaking containers.
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 			defer stop()
+
+			store, err := OpenStore(dbPath)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
 
 			runner, err := NewDockerRunner(image, outDir, env, cpus, timeout)
 			if err != nil {
 				return err
 			}
 
-			// Seeds come from one base seed, so a whole campaign is reproducible.
+			runID, err := store.CreateRun(RunInfo{
+				StartedAt: time.Now(), Image: image, BaseSeed: baseSeed,
+				Workers: workers, CPUs: cpus, Env: env,
+			})
+			if err != nil {
+				return fmt.Errorf("save run: %w", err)
+			}
+
+			// derive seeds from one base seed so a whole run is reproducible
 			rng := rand.New(rand.NewSource(baseSeed))
 			trials := make([]Trial, runs)
 			for i := range trials {
 				trials[i] = Trial{ID: i + 1, Seed: rng.Int63n(1 << 31)}
 			}
 
-			fmt.Fprintf(os.Stderr, "running %d trials of %s with %d workers (base seed %d)\n",
-				runs, image, workers, baseSeed)
+			fmt.Fprintf(os.Stderr, "run #%d: %d trials of %s with %d workers (base seed %d)\n",
+				runID, runs, image, workers, baseSeed)
 			start := time.Now()
 
+			// results are only handled here, so this loop is the single db writer
 			agg := NewAggregate()
 			for res := range RunAll(ctx, runner, trials, workers) {
+				if err := store.SaveTrial(runID, res); err != nil {
+					return fmt.Errorf("save trial %d: %w", res.Trial.ID, err)
+				}
 				agg.Add(res)
 				if res.Err != nil {
 					fmt.Fprintf(os.Stderr, "  trial %d: infrastructure error: %v\n", res.Trial.ID, res.Err)
@@ -71,7 +92,14 @@ func runCmd() *cobra.Command {
 			}
 			fmt.Fprintf(os.Stderr, "\n  finished in %s\n\n", time.Since(start).Round(time.Second))
 
+			if ctx.Err() != nil {
+				fmt.Fprintf(os.Stderr, "interrupted, run #%d has partial results\n\n", runID)
+			} else if err := store.FinishRun(runID); err != nil {
+				return err
+			}
+
 			printReport(agg, image, env)
+			fmt.Printf("\nsaved as run #%d in %s (see it again with: flakehunt report %d)\n", runID, dbPath, runID)
 			return ctx.Err()
 		},
 	}
@@ -87,6 +115,77 @@ func runCmd() *cobra.Command {
 	f.Int64Var(&baseSeed, "seed", time.Now().UnixNano(), "base seed for the campaign")
 	_ = cmd.MarkFlagRequired("image")
 	return cmd
+}
+
+func runsCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "runs",
+		Short: "List saved runs",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := OpenStore(dbPath)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+
+			runs, err := store.ListRuns()
+			if err != nil {
+				return err
+			}
+			if len(runs) == 0 {
+				fmt.Println("no runs yet")
+				return nil
+			}
+			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+			fmt.Fprintln(w, "ID\tSTARTED\tIMAGE\tTRIALS\tWORKERS\tCPUS\tSTATUS")
+			for _, r := range runs {
+				status := "done"
+				if !r.Finished {
+					status = "incomplete"
+				}
+				cpus := "-"
+				if r.CPUs > 0 {
+					cpus = strconv.FormatFloat(r.CPUs, 'g', -1, 64)
+				}
+				fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%d\t%s\t%s\n",
+					r.ID, r.StartedAt.Local().Format("2006-01-02 15:04"), r.Image, r.Trials, r.Workers, cpus, status)
+			}
+			return w.Flush()
+		},
+	}
+}
+
+func reportCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "report <run-id>",
+		Short: "Show the report for a saved run",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			runID, err := strconv.ParseInt(args[0], 10, 64)
+			if err != nil {
+				return fmt.Errorf("run id should be a number, got %q", args[0])
+			}
+
+			store, err := OpenStore(dbPath)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+
+			run, err := store.GetRun(runID)
+			if err != nil {
+				return err
+			}
+			agg, err := store.LoadAggregate(runID)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("run #%d, %s, %d trials, %d workers\n\n",
+				run.ID, run.StartedAt.Local().Format("2006-01-02 15:04"), agg.Trials, run.Workers)
+			printReport(agg, run.Image, run.Env)
+			return nil
+		},
+	}
 }
 
 func printReport(agg *Aggregate, image string, env []string) {
