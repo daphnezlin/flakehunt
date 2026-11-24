@@ -49,6 +49,10 @@ var migrations = []string{
 	ALTER TABLE trials ADD COLUMN cpus REAL NOT NULL DEFAULT 0;
 	ALTER TABLE trials ADD COLUMN cpuset TEXT NOT NULL DEFAULT '';
 	`,
+	// 3: replay trials ('' = normal trial)
+	`
+	ALTER TABLE trials ADD COLUMN replay_for TEXT NOT NULL DEFAULT '';
+	`,
 }
 
 type Store struct {
@@ -171,8 +175,8 @@ func (s *Store) SaveTrial(runID int64, res TrialResult) error {
 		status, errMsg = "error", res.Err.Error()
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO trials (run_id, trial_id, seed, cpus, cpuset, status, error) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		runID, res.Trial.ID, res.Trial.Seed, res.Trial.CPUs, res.CPUSet, status, errMsg,
+		`INSERT INTO trials (run_id, trial_id, seed, cpus, cpuset, replay_for, status, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		runID, res.Trial.ID, res.Trial.Seed, res.Trial.CPUs, res.CPUSet, res.Trial.ReplayFor, status, errMsg,
 	); err != nil {
 		return err
 	}
@@ -198,7 +202,7 @@ func (s *Store) SaveTrial(runID int64, res TrialResult) error {
 
 func (s *Store) ListRuns() ([]RunInfo, error) {
 	rows, err := s.db.Query(`
-		SELECT r.id, r.started_at, r.finished_at IS NOT NULL, r.image, r.workers, r.cpu_levels, COUNT(t.trial_id)
+		SELECT r.id, r.started_at, r.finished_at IS NOT NULL, r.image, r.workers, r.cpu_levels, COUNT(CASE WHEN t.replay_for = '' THEN 1 END)
 		FROM runs r LEFT JOIN trials t ON t.run_id = r.id
 		GROUP BY r.id ORDER BY r.id`)
 	if err != nil {
@@ -246,7 +250,7 @@ func (s *Store) LoadAggregate(runID int64) (*Aggregate, error) {
 	trials := map[int]*TrialResult{}
 	var order []int
 
-	rows, err := s.db.Query(`SELECT trial_id, seed, cpus, cpuset, status, error FROM trials WHERE run_id = ? ORDER BY trial_id`, runID)
+	rows, err := s.db.Query(`SELECT trial_id, seed, cpus, cpuset, status, error FROM trials WHERE run_id = ? AND replay_for = '' ORDER BY trial_id`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +290,7 @@ func (s *Store) LoadAggregate(runID int64) (*Aggregate, error) {
 		if err := rows.Scan(&id, &test, &outcome); err != nil {
 			return nil, err
 		}
-		if tr := trials[id]; tr != nil {
+		if tr := trials[id]; tr != nil { // nil for replay trials
 			tr.Tests = append(tr.Tests, TestOutcome{Name: test, Failed: outcome == "fail", Skip: outcome == "skip"})
 		}
 	}
@@ -299,4 +303,37 @@ func (s *Store) LoadAggregate(runID int64) (*Aggregate, error) {
 		agg.Add(*trials[id])
 	}
 	return agg, nil
+}
+
+// LoadReplays counts how the target test did in each replay trial, keyed by test name.
+func (s *Store) LoadReplays(runID int64) (map[string]*Count, error) {
+	rows, err := s.db.Query(`
+		SELECT t.replay_for, r.outcome
+		FROM trials t JOIN results r ON r.run_id = t.run_id AND r.trial_id = t.trial_id
+		WHERE t.run_id = ? AND t.replay_for != '' AND r.test = t.replay_for`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	replays := map[string]*Count{}
+	for rows.Next() {
+		var test, outcome string
+		if err := rows.Scan(&test, &outcome); err != nil {
+			return nil, err
+		}
+		if outcome == "skip" {
+			continue
+		}
+		c := replays[test]
+		if c == nil {
+			c = &Count{}
+			replays[test] = c
+		}
+		c.Runs++
+		if outcome == "fail" {
+			c.Failures++
+		}
+	}
+	return replays, rows.Err()
 }
