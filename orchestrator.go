@@ -2,13 +2,33 @@ package main
 
 import (
 	"context"
+	"math/rand"
 	"sort"
 	"sync"
 )
 
-// RunAll executes trials with at most `workers` running at once.
-// Results arrive on the returned channel in completion order; the channel
-// closes when every trial is done or ctx is cancelled.
+// MakeTrials gives each cpu level the same number of trials (as close as
+// possible), then shuffles so levels are spread across the whole run instead
+// of all the 0.5 trials running back to back. Equal group sizes make the
+// per-level comparison fairer.
+func MakeTrials(n int, cpuLevels []float64, baseSeed int64) []Trial {
+	if len(cpuLevels) == 0 {
+		cpuLevels = []float64{0}
+	}
+	rng := rand.New(rand.NewSource(baseSeed))
+	trials := make([]Trial, n)
+	for i := range trials {
+		trials[i] = Trial{Seed: rng.Int63n(1 << 31), CPUs: cpuLevels[i%len(cpuLevels)]}
+	}
+	rng.Shuffle(n, func(i, j int) { trials[i].CPUs, trials[j].CPUs = trials[j].CPUs, trials[i].CPUs })
+	for i := range trials {
+		trials[i].ID = i + 1
+	}
+	return trials
+}
+
+// RunAll runs trials with at most `workers` at once. Results come back in
+// completion order and the channel closes when everything's done or ctx is cancelled.
 func RunAll(ctx context.Context, r Runner, trials []Trial, workers int) <-chan TrialResult {
 	jobs := make(chan Trial)
 	results := make(chan TrialResult)
@@ -29,7 +49,6 @@ func RunAll(ctx context.Context, r Runner, trials []Trial, workers int) <-chan T
 		}()
 	}
 
-	// Feed trials, stopping early if cancelled (e.g. Ctrl+C).
 	go func() {
 		defer close(jobs)
 		for _, t := range trials {
@@ -48,26 +67,29 @@ func RunAll(ctx context.Context, r Runner, trials []Trial, workers int) <-chan T
 	return results
 }
 
-// TestStats aggregates one test's outcomes across all trials.
-type TestStats struct {
-	Name         string
-	Runs         int
-	Failures     int
-	FailingSeeds []int64
+type Count struct {
+	Runs     int
+	Failures int
 }
 
-func (s TestStats) Rate() float64 {
-	if s.Runs == 0 {
+func (c Count) Rate() float64 {
+	if c.Runs == 0 {
 		return 0
 	}
-	return float64(s.Failures) / float64(s.Runs)
+	return float64(c.Failures) / float64(c.Runs)
 }
 
-// Flaky means it both passed and failed on the same code.
+type TestStats struct {
+	Name string
+	Count
+	ByCPU   map[float64]*Count
+	Failing []Trial // trials where it failed, for repro commands
+}
+
+// passed and failed on the same code
 func (s TestStats) Flaky() bool { return s.Failures > 0 && s.Failures < s.Runs }
 
-// Aggregate is the single place results are combined, so no locking is needed:
-// only one goroutine (the caller) ever touches the map.
+// Aggregate is only touched by one goroutine, so no locks.
 type Aggregate struct {
 	Tests      map[string]*TestStats
 	Trials     int
@@ -93,18 +115,25 @@ func (a *Aggregate) Add(res TrialResult) {
 		}
 		s := a.Tests[o.Name]
 		if s == nil {
-			s = &TestStats{Name: o.Name}
+			s = &TestStats{Name: o.Name, ByCPU: map[float64]*Count{}}
 			a.Tests[o.Name] = s
 		}
+		c := s.ByCPU[res.Trial.CPUs]
+		if c == nil {
+			c = &Count{}
+			s.ByCPU[res.Trial.CPUs] = c
+		}
 		s.Runs++
+		c.Runs++
 		if o.Failed {
 			s.Failures++
-			s.FailingSeeds = append(s.FailingSeeds, res.Trial.Seed)
+			c.Failures++
+			s.Failing = append(s.Failing, res.Trial)
 		}
 	}
 }
 
-// Sorted returns tests ordered by failure rate, highest first.
+// Sorted: highest failure rate first.
 func (a *Aggregate) Sorted() []*TestStats {
 	out := make([]*TestStats, 0, len(a.Tests))
 	for _, s := range a.Tests {
@@ -117,4 +146,19 @@ func (a *Aggregate) Sorted() []*TestStats {
 		return out[i].Name < out[j].Name
 	})
 	return out
+}
+
+// CPULevels returns the levels seen for a test, unlimited first then highest to lowest.
+func (s TestStats) CPULevels() []float64 {
+	levels := make([]float64, 0, len(s.ByCPU))
+	for l := range s.ByCPU {
+		levels = append(levels, l)
+	}
+	sort.Slice(levels, func(i, j int) bool {
+		if levels[i] == 0 || levels[j] == 0 {
+			return levels[i] == 0 && levels[j] != 0
+		}
+		return levels[i] > levels[j]
+	})
+	return levels
 }

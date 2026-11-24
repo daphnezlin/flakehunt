@@ -46,7 +46,7 @@ func TestStoreRoundTrip(t *testing.T) {
 		t.Errorf("counts: got %+v", loaded)
 	}
 	flaky := loaded.Tests["m::flaky"]
-	if flaky == nil || flaky.Runs != 2 || flaky.Failures != 1 || flaky.FailingSeeds[0] != 100 {
+	if flaky == nil || flaky.Runs != 2 || flaky.Failures != 1 || flaky.Failing[0].Seed != 100 {
 		t.Errorf("flaky stats: got %+v", flaky)
 	}
 	if _, ok := loaded.Tests["m::skipped"]; ok {
