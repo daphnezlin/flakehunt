@@ -40,6 +40,7 @@ func runCmd() *cobra.Command {
 		toxiImage string
 		replays   int
 		polluters bool
+		markdown  string
 		timeout   time.Duration
 		env       []string
 		outDir    string
@@ -134,8 +135,21 @@ func runCmd() *cobra.Command {
 				return err
 			}
 
-			printReport(agg, Analyze(agg, replayCounts, found), image, env)
-			fmt.Printf("\nsaved as run #%d in %s (see it again with: flakehunt report %d)\n", runID, dbPath, runID)
+			causes := Analyze(agg, replayCounts, found)
+			printReport(agg, causes, image, env)
+			fmt.Printf("\nsaved as run #%d in %s (see it again with: %s report %d)\n", runID, dbPath, os.Args[0], runID)
+
+			if markdown != "" {
+				run, err := store.GetRun(runID)
+				if err != nil {
+					return err
+				}
+				path, err := writeMarkdownFile(markdown, run, agg, causes)
+				if err != nil {
+					return fmt.Errorf("write markdown report: %w", err)
+				}
+				fmt.Printf("markdown report: %s\n", path)
+			}
 			return ctx.Err()
 		},
 	}
@@ -154,6 +168,7 @@ func runCmd() *cobra.Command {
 	f.StringVar(&toxiImage, "toxiproxy-image", "ghcr.io/shopify/toxiproxy:2.13.0", "toxiproxy image used to add latency")
 	f.IntVar(&replays, "replays", 5, "reruns of each flaky test's failing seed, to check if the seed alone causes it (0 = off)")
 	f.BoolVar(&polluters, "find-polluters", true, "for seed-dependent tests, check if they fail alone and find which earlier test breaks them")
+	f.StringVar(&markdown, "markdown", defaultMarkdownPath, "where to write a markdown report, {id} is the run id (\"\" = don't write one)")
 	f.DurationVar(&timeout, "timeout", 5*time.Minute, "per-trial timeout; longer runs count as hangs")
 	f.StringArrayVar(&env, "env", nil, "env var for every trial, KEY=VALUE (repeatable)")
 	f.StringVar(&outDir, "out", "flakehunt-out", "folder for per-trial results")
@@ -309,8 +324,11 @@ func runsCmd() *cobra.Command {
 	}
 }
 
+const defaultMarkdownPath = "flakehunt-reports/run-{id}.md"
+
 func reportCmd() *cobra.Command {
-	return &cobra.Command{
+	var markdown string
+	cmd := &cobra.Command{
 		Use:   "report <run-id>",
 		Short: "Show the report for a saved run",
 		Args:  cobra.ExactArgs(1),
@@ -342,168 +360,24 @@ func reportCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			causes := Analyze(agg, replays, polluters)
+
+			if markdown != "" {
+				path, err := writeMarkdownFile(markdown, run, agg, causes)
+				if err != nil {
+					return fmt.Errorf("write markdown report: %w", err)
+				}
+				fmt.Printf("markdown report: %s\n", path)
+				return nil
+			}
 			fmt.Printf("run #%d, %s, %d trials, %d workers\n\n",
 				run.ID, run.StartedAt.Local().Format("2006-01-02 15:04"), agg.Trials, run.Workers)
-			printReport(agg, Analyze(agg, replays, polluters), run.Image, run.Env)
+			printReport(agg, causes, run.Image, run.Env)
 			return nil
 		},
 	}
-}
-
-func printReport(agg *Aggregate, causes []Cause, image string, env []string) {
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "TEST\tFAILED\tRATE\t95% CI\tVERDICT")
-	var flaky []*TestStats
-	for _, s := range agg.Sorted() {
-		low, high := Wilson(s.Failures, s.Runs)
-		verdict := "stable"
-		switch {
-		case s.Flaky():
-			verdict = "FLAKY"
-			flaky = append(flaky, s)
-		case s.Failures == s.Runs && s.Runs > 0:
-			verdict = "always fails"
-		}
-		fmt.Fprintf(w, "%s\t%d/%d\t%.1f%%\t%.1f-%.1f%%\t%s\n",
-			s.Name, s.Failures, s.Runs, 100*s.Rate(), 100*low, 100*high, verdict)
-	}
-	w.Flush()
-
-	if agg.InfraFails > 0 || agg.Timeouts > 0 {
-		fmt.Printf("\n%d trials had infrastructure errors, %d timed out (excluded from rates)\n",
-			agg.InfraFails, agg.Timeouts)
-	}
-
-	if len(flaky) == 0 {
-		fmt.Println("\nNo flaky tests found.")
-		return
-	}
-	fmt.Println("\nFailure rate by CPU limit:")
-	for _, s := range flaky {
-		fmt.Printf("  %s\n   ", s.Name)
-		for _, l := range s.CPULevels() {
-			c := s.ByCPU[l]
-			fmt.Printf("  %s: %d/%d (%.0f%%)", formatLevel(l), c.Failures, c.Runs, 100*c.Rate())
-		}
-		fmt.Println()
-	}
-
-	showLatency := false
-	for _, s := range flaky {
-		if len(s.ByLatency) > 1 {
-			showLatency = true
-		}
-	}
-	if showLatency {
-		fmt.Println("\nFailure rate by network latency:")
-		for _, s := range flaky {
-			fmt.Printf("  %s\n   ", s.Name)
-			for _, l := range s.LatencyLevels() {
-				c := s.ByLatency[l]
-				fmt.Printf("  %s: %d/%d (%.0f%%)", formatLatency(int(l)), c.Failures, c.Runs, 100*c.Rate())
-			}
-			fmt.Println()
-		}
-	}
-
-	fmt.Println("\nLikely causes:")
-	for _, c := range causes {
-		fmt.Printf("  %s\n    %s: %s\n", c.Test, c.Label, c.Detail)
-		var evidence []string
-		if c.CPUTested {
-			evidence = append(evidence, fmt.Sprintf("cpu trend p=%s (adjusted %s)", formatP(c.CPUp), formatP(c.CPUq)))
-		}
-		if c.NetTested {
-			evidence = append(evidence, fmt.Sprintf("latency trend p=%s (adjusted %s)", formatP(c.NetP), formatP(c.NetQ)))
-		}
-		if c.Replays.Runs > 0 {
-			evidence = append(evidence, fmt.Sprintf("failing seed rerun %d/%d failed", c.Replays.Failures, c.Replays.Runs))
-		}
-		if c.Polluter != nil {
-			evidence = append(evidence, fmt.Sprintf("polluter search used %d runs", c.Polluter.Probes))
-		}
-		if len(evidence) > 0 {
-			fmt.Printf("    %s\n", strings.Join(evidence, ", "))
-		}
-	}
-
-	var envFlags strings.Builder
-	for _, e := range env {
-		envFlags.WriteString(" -e " + e)
-	}
-	minimal := map[string]string{}
-	for _, c := range causes {
-		p := c.Polluter
-		switch {
-		case p == nil:
-		case p.FailsAlone:
-			minimal[c.Test] = p.VictimNode
-		case p.PolluterNode != "":
-			minimal[c.Test] = p.PolluterNode + " " + p.VictimNode
-		}
-	}
-
-	fmt.Println("\nReproduce (a trial where each flaky test failed):")
-	for _, s := range flaky {
-		if tests, ok := minimal[s.Name]; ok {
-			fmt.Printf("  %s\n    docker run --rm%s %s pytest -q -p no:cacheprovider --randomly-seed=%d --randomly-dont-reorganize %s\n",
-				s.Name, envFlags.String(), image, s.Failing[0].Seed, tests)
-			continue
-		}
-		t := s.Failing[0]
-		cpuFlag := ""
-		if t.CPUs > 0 {
-			cpuFlag = " --cpus " + formatLevel(t.CPUs)
-		}
-		fmt.Printf("  %s\n    docker run --rm%s%s %s pytest -q -p no:cacheprovider --randomly-seed=%d\n",
-			s.Name, cpuFlag, envFlags.String(), image, t.Seed)
-		if t.LatencyMS > 0 {
-			fmt.Printf("    (failed with %dms latency to the service, which docker run alone won't add:\n"+
-				"     rerun flakehunt with --latency-levels %d to reproduce)\n", t.LatencyMS, t.LatencyMS)
-		}
-	}
-	fmt.Println("\nNote: a seed reproduces order and random data, not timing. Timing races may need several tries.")
-}
-
-func formatP(p float64) string {
-	if p < 0.001 {
-		return "<0.001"
-	}
-	return strconv.FormatFloat(p, 'f', 3, 64)
-}
-
-func formatLevel(l float64) string {
-	if l == 0 {
-		return "no limit"
-	}
-	return strconv.FormatFloat(l, 'g', -1, 64)
-}
-
-func formatLatency(ms int) string {
-	if ms == 0 {
-		return "none"
-	}
-	return fmt.Sprintf("%d+/-%dms", ms, Jitter(ms))
-}
-
-func formatLatencies(ls []int) string {
-	if len(ls) == 0 {
-		return "-"
-	}
-	parts := make([]string, len(ls))
-	for i, l := range ls {
-		parts[i] = formatLatency(l)
-	}
-	return strings.Join(parts, ", ")
-}
-
-func formatLevels(ls []float64) string {
-	if len(ls) == 0 {
-		return "-"
-	}
-	parts := make([]string, len(ls))
-	for i, l := range ls {
-		parts[i] = formatLevel(l)
-	}
-	return strings.Join(parts, ", ")
+	cmd.Flags().StringVar(&markdown, "markdown", "", "write a markdown report to this path instead of printing ({id} is the run id)")
+	// --markdown on its own uses the default path
+	cmd.Flags().Lookup("markdown").NoOptDefVal = defaultMarkdownPath
+	return cmd
 }

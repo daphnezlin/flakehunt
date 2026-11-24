@@ -4,3 +4,4 @@ flakehunt-out/
 flakehunt.db
 flakehunt.db-wal
 flakehunt.db-shm
+flakehunt-reports/
