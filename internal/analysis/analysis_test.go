@@ -22,7 +22,9 @@ func stats(levels []float64, fails, runs []int) *TestStats {
 func TestTrendPValue(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	levels := []float64{0, 1, 0.5}
-	trend := func(s *TestStats, _ *rand.Rand) float64 { return TrendPValue(s.CPULevels(), s.ByCPU, rng) }
+	trend := func(s *TestStats, _ *rand.Rand) float64 {
+		return TrendPValue(s.CPULevels(), []map[float64]*Count{s.ByCPU}, rng)
+	}
 
 	// clear trend, like the race test
 	if p := trend(stats(levels, []int{2, 8, 16}, []int{20, 20, 20}), rng); p > 0.001 {
@@ -139,5 +141,47 @@ func TestAnalyzeSeparatesCPUAndNetwork(t *testing.T) {
 	}
 	if got["slow api"] != "network" || got["race"] != "timing" {
 		t.Errorf("got %v", got)
+	}
+}
+
+func TestTrendPValueStrata(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	levels := []float64{0, 1, 0.5}
+	by := func(fails ...int) map[float64]*Count {
+		m := map[float64]*Count{}
+		for i, l := range levels {
+			if fails[i] >= 0 {
+				m[l] = &Count{Runs: 20, Failures: fails[i]}
+			}
+		}
+		return m
+	}
+
+	// confounded: the slow-cpu trials all come from a context where the test
+	// fails a lot anyway. pooled, that looks like a cpu effect. split by
+	// context, each stratum only has one level, so there's nothing to compare
+	full := by(2, 2, -1)
+	focus := by(-1, -1, 16)
+	pooled := map[float64]*Count{0: full[0], 1: full[1], 0.5: focus[0.5]}
+	if p := TrendPValue(levels, []map[float64]*Count{pooled}, rng); p > 0.001 {
+		t.Fatalf("setup: pooled should look significant, got %v", p)
+	}
+	if p := TrendPValue(levels, []map[float64]*Count{full, focus}, rng); p < 0.5 {
+		t.Errorf("stratified should see no evidence, got %v", p)
+	}
+
+	// a real trend inside both contexts, at different base rates
+	if p := TrendPValue(levels, []map[float64]*Count{by(2, 4, 10), by(8, 11, 17)}, rng); p > 0.001 {
+		t.Errorf("trend in both strata should be significant, got %v", p)
+	}
+}
+
+func TestFinalAlpha(t *testing.T) {
+	if FinalAlpha(0) != DefaultAlpha {
+		t.Errorf("no early checks should give the default")
+	}
+	// interim budget comes off the final threshold so the total stays at 5%
+	if got := FinalAlpha(3); math.Abs(got+3*InterimAlpha-DefaultAlpha) > 1e-12 {
+		t.Errorf("FinalAlpha(3) = %v", got)
 	}
 }

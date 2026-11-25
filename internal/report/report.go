@@ -170,6 +170,10 @@ func WriteMarkdown(w io.Writer, run store.RunInfo, agg *analysis.Aggregate, caus
 	if run.Service != "" {
 		fmt.Fprintf(&b, "- **Network latency:** %s (service `%s`)\n", FormatLatencies(run.LatencyLevels), run.Service)
 	}
+	if run.Alpha > 0 && run.Alpha < analysis.DefaultAlpha {
+		fmt.Fprintf(&b, "- **Significance:** adjusted p < %s, stricter than %s because the run checks after each batch and can stop early\n",
+			strconv.FormatFloat(run.Alpha, 'g', 4, 64), strconv.FormatFloat(analysis.DefaultAlpha, 'g', -1, 64))
+	}
 	if agg.InfraFails > 0 || agg.Timeouts > 0 {
 		fmt.Fprintf(&b, "- **Excluded:** %d trials with infrastructure errors, %d timed out\n", agg.InfraFails, agg.Timeouts)
 	}

@@ -8,7 +8,12 @@ import (
 
 const (
 	permutations = 10000
-	alpha        = 0.05 // after Benjamini-Hochberg correction
+	// DefaultAlpha is the significance threshold after Benjamini-Hochberg
+	// correction, for a run that only checks once at the end
+	DefaultAlpha = 0.05
+	// InterimAlpha is the bar for an early check to count a cause as found
+	// (see FinalAlpha)
+	InterimAlpha = 0.001
 )
 
 // Cause is the best guess at why a flaky test is flaky, plus the evidence.
@@ -22,6 +27,7 @@ type Cause struct {
 	NetQ      float64
 	Replays   Count // reruns of a failing seed with no cpu limit
 	Polluter  *PolluterResult
+	Alpha     float64 // threshold the q-values were compared against
 	Label     string
 	Detail    string
 }
@@ -33,40 +39,72 @@ type Cause struct {
 // failed is basically random, so we shuffle the failures across runs many times
 // and see how often a shuffle looks at least as bad as what we observed.
 //
+// Shuffles only happen within a stratum (e.g. full-suite trials vs focused
+// trials of one test). A test can fail at a different base rate when it runs
+// alone, and shuffling across both kinds of trial would mix that difference
+// into the cpu/latency comparison. Within each stratum, every trial ran in the
+// same context, so only the condition differs. With one stratum this is the
+// plain permutation test.
+//
 // Permutation instead of a chi-square/normal approximation since counts per
 // level are small (10-20 runs). One sided since worse conditions making a test
 // pass more often isn't something we're looking for.
-func TrendPValue(levels []float64, by map[float64]*Count, rng *rand.Rand) float64 {
+func TrendPValue(levels []float64, strata []map[float64]*Count, rng *rand.Rand) float64 {
 	if len(levels) < 2 {
 		return math.NaN()
 	}
-	var ranks []int
-	observed, f := 0, 0
-	for i, l := range levels {
-		c := by[l]
-		for j := 0; j < c.Runs; j++ {
-			ranks = append(ranks, i)
-		}
-		observed += i * c.Failures
-		f += c.Failures
+	type group struct {
+		ranks []int
+		idx   []int
+		f     int
 	}
-	n := len(ranks)
-	if f == 0 || f == n {
+	var groups []group
+	observed, fixed := 0, 0 // fixed: part of the statistic shuffling can't change
+	for _, by := range strata {
+		var g group
+		for i, l := range levels {
+			c := by[l]
+			if c == nil {
+				continue
+			}
+			for j := 0; j < c.Runs; j++ {
+				g.ranks = append(g.ranks, i)
+			}
+			observed += i * c.Failures
+			g.f += c.Failures
+		}
+		n := len(g.ranks)
+		if g.f == 0 || g.f == n {
+			// all passed or all failed: every shuffle gives the same sum
+			for _, r := range g.ranks {
+				if g.f == n {
+					fixed += r
+				}
+			}
+			continue
+		}
+		g.idx = make([]int, n)
+		for i := range g.idx {
+			g.idx[i] = i
+		}
+		groups = append(groups, g)
+	}
+	if len(groups) == 0 {
 		return 1
 	}
 
-	idx := make([]int, n)
-	for i := range idx {
-		idx[i] = i
-	}
 	atLeast := 0
 	for p := 0; p < permutations; p++ {
-		// partial Fisher-Yates: pick f random runs to be the failures
-		t := 0
-		for k := 0; k < f; k++ {
-			j := k + rng.Intn(n-k)
-			idx[k], idx[j] = idx[j], idx[k]
-			t += ranks[idx[k]]
+		t := fixed
+		for gi := range groups {
+			g := &groups[gi]
+			n := len(g.ranks)
+			// partial Fisher-Yates: pick f random runs in this stratum to be the failures
+			for k := 0; k < g.f; k++ {
+				j := k + rng.Intn(n-k)
+				g.idx[k], g.idx[j] = g.idx[j], g.idx[k]
+				t += g.ranks[g.idx[k]]
+			}
 		}
 		if t >= observed {
 			atLeast++
@@ -103,6 +141,12 @@ func BenjaminiHochberg(ps []float64) []float64 {
 // Analyze works out a cause for every flaky test. replays and polluters are
 // keyed by test name and either can be nil.
 func Analyze(agg *Aggregate, replays map[string]*Count, polluters map[string]PolluterResult) []Cause {
+	return AnalyzeAt(agg, replays, polluters, DefaultAlpha)
+}
+
+// AnalyzeAt is Analyze with a custom significance threshold. Runs that check
+// several times and stop early need a stricter one (see FinalAlpha).
+func AnalyzeAt(agg *Aggregate, replays map[string]*Count, polluters map[string]PolluterResult, alpha float64) []Cause {
 	// fixed seed so the same run always gives the same p-values
 	rng := rand.New(rand.NewSource(1))
 
@@ -115,14 +159,14 @@ func Analyze(agg *Aggregate, replays map[string]*Count, polluters map[string]Pol
 		if !s.Flaky() {
 			continue
 		}
-		c := Cause{Test: s.Name}
+		c := Cause{Test: s.Name, Alpha: alpha}
 		i := len(causes)
-		if p := TrendPValue(s.CPULevels(), s.ByCPU, rng); !math.IsNaN(p) {
+		if p := TrendPValue(s.CPULevels(), strata(s.StrataCPU), rng); !math.IsNaN(p) {
 			c.CPUTested, c.CPUp = true, p
 			ps = append(ps, p)
 			setQ = append(setQ, func(q float64) { causes[i].CPUq = q })
 		}
-		if p := TrendPValue(s.LatencyLevels(), s.ByLatency, rng); !math.IsNaN(p) {
+		if p := TrendPValue(s.LatencyLevels(), strata(s.StrataLatency), rng); !math.IsNaN(p) {
 			c.NetTested, c.NetP = true, p
 			ps = append(ps, p)
 			setQ = append(setQ, func(q float64) { causes[i].NetQ = q })
@@ -186,8 +230,49 @@ func classifySeed(p PolluterResult) (label, detail string) {
 }
 
 // CPUSensitive and NetworkSensitive are true when the trend test found a real effect.
-func (c Cause) CPUSensitive() bool     { return c.CPUTested && c.CPUq < alpha }
-func (c Cause) NetworkSensitive() bool { return c.NetTested && c.NetQ < alpha }
+func (c Cause) CPUSensitive() bool     { return c.CPUTested && c.CPUq < c.threshold() }
+func (c Cause) NetworkSensitive() bool { return c.NetTested && c.NetQ < c.threshold() }
+
+func (c Cause) threshold() float64 {
+	if c.Alpha == 0 {
+		return DefaultAlpha
+	}
+	return c.Alpha
+}
+
+// FinalAlpha is the threshold for the last check of a run that also checked
+// `interim` times before it and could have stopped at any of them.
+//
+// Checking after every batch and stopping as soon as something looks
+// significant gives chance more opportunities to produce a false positive.
+// This uses a Haybittle-Peto boundary: early checks need very strong evidence
+// (InterimAlpha) to stop, so almost all of the error budget is left for the
+// final check. Taking the interim budget off the final threshold keeps the
+// overall false positive rate at or below DefaultAlpha (union bound).
+//
+// Splitting alpha evenly across checks (Bonferroni) also works, but it made
+// the final check so strict that a real cpu effect was missed in testing.
+func FinalAlpha(interim int) float64 {
+	if interim < 0 {
+		interim = 0
+	}
+	return DefaultAlpha - InterimAlpha*float64(interim)
+}
+
+// strata turns per-stratum counts into a list with a stable order, so the
+// same data always gives the same p-value.
+func strata(m map[string]map[float64]*Count) []map[float64]*Count {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]map[float64]*Count, len(keys))
+	for i, k := range keys {
+		out[i] = m[k]
+	}
+	return out
+}
 
 // CausesByName indexes causes by test name.
 func CausesByName(causes []Cause) map[string]*Cause {

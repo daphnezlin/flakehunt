@@ -22,7 +22,13 @@ type TestStats struct {
 	Count
 	ByCPU     map[float64]*Count
 	ByLatency map[float64]*Count // keyed by latency ms
-	Failing   []runner.Trial     // trials where it failed, for repro commands
+
+	// the same counts split by kind of trial: "" for full-suite trials,
+	// "focus" for trials of just a few tests. the trend test compares
+	// conditions within each kind
+	StrataCPU     map[string]map[float64]*Count
+	StrataLatency map[string]map[float64]*Count
+	Failing       []runner.Trial // trials where it failed, for repro commands
 
 	// every test's result from the first failing trial, in the order they ran.
 	// the polluter search needs to know what ran before it
@@ -58,18 +64,24 @@ func (a *Aggregate) Add(res runner.TrialResult) {
 		}
 		s := a.Tests[o.Name]
 		if s == nil {
-			s = &TestStats{Name: o.Name, ByCPU: map[float64]*Count{}, ByLatency: map[float64]*Count{}}
+			s = &TestStats{Name: o.Name, ByCPU: map[float64]*Count{}, ByLatency: map[float64]*Count{},
+				StrataCPU: map[string]map[float64]*Count{}, StrataLatency: map[string]map[float64]*Count{}}
 			a.Tests[o.Name] = s
 		}
-		cpu := countFor(s.ByCPU, res.Trial.CPUs)
-		lat := countFor(s.ByLatency, float64(res.Trial.LatencyMS))
-		s.Runs++
-		cpu.Runs++
-		lat.Runs++
+		counts := []*Count{
+			&s.Count,
+			countFor(s.ByCPU, res.Trial.CPUs),
+			countFor(s.ByLatency, float64(res.Trial.LatencyMS)),
+			countFor(stratum(s.StrataCPU, res.Trial.Probe), res.Trial.CPUs),
+			countFor(stratum(s.StrataLatency, res.Trial.Probe), float64(res.Trial.LatencyMS)),
+		}
+		for _, c := range counts {
+			c.Runs++
+			if o.Failed {
+				c.Failures++
+			}
+		}
 		if o.Failed {
-			s.Failures++
-			cpu.Failures++
-			lat.Failures++
 			s.Failing = append(s.Failing, res.Trial)
 			if s.FirstFailure == nil {
 				s.FirstFailure = res.Tests
@@ -125,4 +137,13 @@ func countFor(m map[float64]*Count, level float64) *Count {
 		m[level] = c
 	}
 	return c
+}
+
+func stratum(m map[string]map[float64]*Count, name string) map[float64]*Count {
+	by := m[name]
+	if by == nil {
+		by = map[float64]*Count{}
+		m[name] = by
+	}
+	return by
 }
