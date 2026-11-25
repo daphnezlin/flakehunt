@@ -120,3 +120,17 @@ func TestFixForEveryLabel(t *testing.T) {
 		}
 	}
 }
+
+func TestSensitivity(t *testing.T) {
+	agg := analysis.NewAggregate()
+	for i := 0; i < 60; i++ {
+		agg.Add(runner.TrialResult{Tests: []runner.TestOutcome{{Name: "ok"}, {Name: "flaky", Failed: i == 3}}})
+	}
+	line := Sensitivity(agg)
+	if !strings.Contains(line, "passed all 60 runs") || !strings.Contains(line, "4.9%") {
+		t.Errorf("got %q", line)
+	}
+	if Sensitivity(analysis.NewAggregate()) != "" {
+		t.Error("no tests should give no line")
+	}
+}

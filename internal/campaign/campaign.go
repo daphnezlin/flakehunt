@@ -218,8 +218,11 @@ func (c *Campaign) replay(ctx context.Context) error {
 // findPolluters runs FindPolluter for every seed-dependent test. Probes run
 // one at a time since each step of the search depends on the last one.
 func (c *Campaign) findPolluters(ctx context.Context) error {
+	// every test whose failing seed failed every replay, even if a trend test
+	// also flagged cpu or latency: a chance trend shouldn't stop us finding the
+	// real cause and a minimal repro
 	for _, cause := range analysis.AnalyzeAt(c.res.Agg, c.res.Replays, nil, c.res.Alpha) {
-		if cause.Label != "seed-dependent" {
+		if !cause.SeedDetermined() {
 			continue
 		}
 		s := c.res.Agg.Tests[cause.Test]

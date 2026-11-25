@@ -48,6 +48,7 @@ func runCmd() *cobra.Command {
 		polluters bool
 		focusN    int
 		focusMax  int
+		catchRate float64
 		markdown  string
 		timeout   time.Duration
 		env       []string
@@ -61,6 +62,11 @@ func runCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 			defer stop()
+
+			runs, err := detectTrials(runs, cmd.Flags().Changed("runs"), catchRate)
+			if err != nil {
+				return err
+			}
 
 			db, err := store.OpenStore(dbPath)
 			if err != nil {
@@ -144,7 +150,8 @@ func runCmd() *cobra.Command {
 
 	f := cmd.Flags()
 	f.StringVar(&image, "image", "", "Docker image containing the project and its tests (required)")
-	f.IntVar(&runs, "runs", 45, "full-suite trials used to find flaky tests")
+	f.IntVar(&runs, "runs", 60, "full-suite trials used to find flaky tests (60 catches a test that fails 5% of the time with 95% probability)")
+	f.Float64Var(&catchRate, "catch-rate", 0, "set --runs so a test failing this often, e.g. 0.01, gets caught with 95% probability")
 	f.IntVar(&workers, "workers", max(1, runtime.NumCPU()/2), "trials running at once")
 	f.Float64SliceVar(&cpuLevels, "cpu-levels", []float64{0, 1, 0.5}, "CPU limits to spread across trials, 0 = no limit")
 	f.IntSliceVar(&latencies, "latency-levels", []int{0, 50, 150}, "network latency in ms added to the service, spread across trials (needs --service-image)")
@@ -372,4 +379,24 @@ func pct(a, b int) string {
 		return "-"
 	}
 	return fmt.Sprintf("%.0f%%", 100*float64(a)/float64(b))
+}
+
+// detectTrials works out how many full-suite trials to run. --catch-rate picks
+// the count for you; --runs sets it directly. Both at once is ambiguous.
+func detectTrials(runs int, runsSet bool, catchRate float64) (int, error) {
+	if catchRate == 0 {
+		if runs < 1 {
+			return 0, fmt.Errorf("--runs must be at least 1")
+		}
+		return runs, nil
+	}
+	if runsSet {
+		return 0, fmt.Errorf("use --runs or --catch-rate, not both")
+	}
+	if catchRate <= 0 || catchRate >= 1 {
+		return 0, fmt.Errorf("--catch-rate should be between 0 and 1, e.g. 0.02 for 2%%")
+	}
+	n := analysis.TrialsToCatch(catchRate, 0.95)
+	fmt.Fprintf(os.Stderr, "--catch-rate %g: %d full-suite trials\n", catchRate, n)
+	return n, nil
 }

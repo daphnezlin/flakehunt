@@ -147,3 +147,15 @@ func stratum(m map[string]map[float64]*Count, name string) map[float64]*Count {
 	}
 	return by
 }
+
+// StableRuns is the fewest runs any never-failing test had, i.e. how hard the
+// "stable" verdicts were tested. 0 if no test passed every run.
+func (a *Aggregate) StableRuns() int {
+	min := 0
+	for _, s := range a.Tests {
+		if s.Failures == 0 && (min == 0 || s.Runs < min) {
+			min = s.Runs
+		}
+	}
+	return min
+}

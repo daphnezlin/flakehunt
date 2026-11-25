@@ -62,3 +62,30 @@ func TestAggregateByCPU(t *testing.T) {
 		t.Errorf("levels order: %v", got)
 	}
 }
+
+func TestDetectionPower(t *testing.T) {
+	cases := []struct {
+		rate float64
+		want int
+	}{{0.10, 29}, {0.05, 59}, {0.02, 149}, {0.01, 299}}
+	for _, c := range cases {
+		n := TrialsToCatch(c.rate, 0.95)
+		if n != c.want {
+			t.Errorf("TrialsToCatch(%v) = %d, want %d", c.rate, n, c.want)
+		}
+		// n is enough, n-1 isn't
+		if CatchProbability(c.rate, n) < 0.95 || CatchProbability(c.rate, n-1) >= 0.95 {
+			t.Errorf("rate %v: %d isn't the smallest enough", c.rate, n)
+		}
+	}
+	if p := CatchProbability(0.05, 45); math.Abs(p-0.90) > 0.01 {
+		t.Errorf("45 runs at 5%% should catch it ~90%% of the time, got %v", p)
+	}
+	if r := CatchableRate(60, 0.95); math.Abs(r-0.0487) > 0.001 {
+		t.Errorf("CatchableRate(60) = %v", r)
+	}
+	// at exactly that rate, 60 runs catch it exactly 95% of the time
+	if p := CatchProbability(CatchableRate(60, 0.95), 60); math.Abs(p-0.95) > 1e-9 {
+		t.Errorf("round trip gave %v", p)
+	}
+}

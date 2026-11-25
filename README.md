@@ -14,18 +14,21 @@ Supports pytest for now.
 Likely causes:
   tests.test_order::test_no_users_initially
     order-dependent: fails when it runs after tests.test_order::test_create_users, which leaves state behind
-    CPU trend p=0.997, latency trend p=0.703, failing seed rerun 5/5 failed, polluter search used 7 runs
+    CPU trend p=0.605, latency trend p=0.681, failing seed rerun 5/5 failed, polluter search used 5 runs
   tests.test_race::test_report_is_ready
     timing: fails more with less cpu, likely a race or a timeout that's too tight
-    CPU trend p=0.002 (adjusted 0.010), latency trend p=0.625, failing seed rerun 3/5 failed
+    CPU trend p<0.001 (adjusted <0.001), latency trend p=0.787, failing seed rerun 2/5 failed
   tests.test_network::test_fetch_status
     network: fails more when the service responds slowly, likely a network timeout that's too tight
-    CPU trend p=0.457, latency trend p<0.001, failing seed rerun 0/5 failed
+    CPU trend p=0.431, latency trend p<0.001, failing seed rerun 0/5 failed
 
 Reproduce:
   tests.test_order::test_no_users_initially
-    docker run --rm flaky-zoo pytest -q -p no:cacheprovider --randomly-seed=1259942384 \
+    docker run --rm flaky-zoo pytest -q -p no:cacheprovider --randomly-seed=388634590 \
       --randomly-dont-reorganize tests/test_order.py::test_create_users tests/test_order.py::test_no_users_initially
+
+tests marked stable passed all 60 runs, so one failing more than 4.9% of the time had a 95%
+chance of being caught. Rarer flakiness can still hide (--catch-rate to look harder).
 ```
 
 Each run also writes a markdown report with a section per flaky test that can be
@@ -34,17 +37,27 @@ pasted into a GitHub issue.
 ## Results
 
 On [`flaky-zoo`](flaky-zoo), a set of tests that are flaky on purpose for known
-reasons, across 3 runs of 135 trials:
+reasons (a timing race, a network timeout, an order dependency, a random data edge case):
 
-| | |
-|---|---|
-| Flaky tests found | 12/12 |
-| Stable tests wrongly flagged | 0/15 |
-| Causes correct | 12/12 |
-| Polluting test named correctly | 3/3 |
+| | Fixed, 135 trials (3 runs) | Adaptive, default (3 runs) |
+|---|---|---|
+| Flaky tests found | 12/12 | 11/12 |
+| Stable tests wrongly flagged | 0/15 | 0/15 |
+| Causes correct | 12/12 | 11/12 |
+| Polluting test named correctly | 3/3 | 3/3 |
+| Test executions per run | ~1,410 | 735 to 841 |
 
-This is a synthetic benchmark, so it mostly checks that nothing is broken.
-Real-world accuracy is next (see [Status](#status)).
+Adaptive sampling (see [How it works](#how-it-works)) got every cause right for the tests it
+caught, with about half the test executions. The one miss is the random data test, which fails
+about 4% of the time. 60 trials catch that roughly 90% of the time, and `--catch-rate 0.02`
+(149 trials) makes a miss very unlikely.
+
+On the zoo the tests take milliseconds and container startup dominates, so wall time depends
+more on how many focus batches a run needs (1m7s with none, 2m20s with three, vs about 2m10s
+fixed). On a suite that takes minutes, time scales with test executions.
+
+This is a synthetic benchmark, so it mostly checks that nothing is broken. Real-world
+accuracy is next (see [Status](#status)).
 
 ## Usage
 
@@ -52,7 +65,7 @@ Needs Go 1.24+ and Docker.
 
 ```
 go build -o flakehunt .
-./flakehunt run --image <image with your project and its tests> --runs 135
+./flakehunt run --image <image with your project and its tests>
 ```
 
 | Command | What it does |
@@ -62,8 +75,18 @@ go build -o flakehunt .
 | `report <id>` | Shows a saved run again (`--markdown` to write the report file) |
 | `score <id>...` | Compares runs against known causes in a json file |
 
-Useful `run` flags: `--runs`, `--workers`, `--cpu-levels` (default `0,1,0.5`),
-`--latency-levels` (default `0,50,150` ms), `--replays`, `--env KEY=VALUE`.
+Useful `run` flags:
+
+| Flag | Default | |
+|---|---|---|
+| `--runs` | 60 | full-suite trials. 60 catches a test that fails 5% of the time with 95% probability |
+| `--catch-rate` | | set `--runs` for you, e.g. `0.01` to catch 1% flaky tests (299 trials) |
+| `--cpu-levels` | `0,1,0.5` | CPU limits, 0 = no limit |
+| `--latency-levels` | `0,50,150` | network latency in ms (needs a service) |
+| `--focus-batch` | 36 | trials per focus batch, 0 turns focusing off |
+| `--focus-batches` | 3 | most focus batches before giving up on a test |
+| `--replays` | 5 | reruns of each flaky test's failing seed |
+| `--workers` | half your cores | trials at once |
 
 If the tests talk to a service (an api, a database), flakehunt can add network
 latency in front of it:
@@ -75,30 +98,33 @@ latency in front of it:
   --service-env 'DATABASE_URL=postgres://postgres@{addr}/test'
 ```
 
-`{addr}` becomes the address of the proxy the tests should connect to.
+`{addr}` becomes the address the tests should connect to.
 
 ## How it works
 
-1. **Trials.** Each trial runs the whole suite in a fresh container with a pytest-randomly
-   seed, which controls test order and random data. Trials get a CPU limit and a network
-   latency, with every combination getting the same number of trials.
-2. **Isolation.** Each trial is pinned to its own CPU cores. With a service, each trial gets its
-   own private Docker network with its own copy of the service and a
-   [Toxiproxy](https://github.com/Shopify/toxiproxy) in front of it that adds the latency.
-3. **Detection.** A test that both passed and failed on the same code is flaky. Failure rates
-   come with Wilson confidence intervals.
-4. **Cause.** For each flaky test:
+1. **Detect.** Full-suite trials, each in a fresh container with a pytest-randomly seed, which
+   controls test order and random data. Trials get a CPU limit and a network latency, with every
+   combination getting the same number of trials. A test that both passed and failed on the same
+   code is flaky. Failure rates come with Wilson confidence intervals.
+2. **Isolate.** Each trial is pinned to its own CPU cores. With a service, each trial gets its own
+   private Docker network and its own copy of the service, with a
+   [Toxiproxy](https://github.com/Shopify/toxiproxy) in front of it when latency is added.
+3. **Explain.** For each flaky test:
    - a one-sided permutation trend test checks if it fails more with less CPU or more latency,
      with Benjamini-Hochberg correction across every check
    - its failing seed is rerun with no limits. Failing every time means the seed alone causes it
-   - for seed-dependent tests, it's run alone. If it passes alone, a binary search over the tests
-     that ran before it finds the one that breaks it
-5. **Storage.** Every trial is saved to SQLite, so any run can be re-reported or scored later.
+   - for those, it's run alone. Failing alone means random data. Passing alone means another test
+     breaks it, and a binary search over the tests that ran before it finds which one
+4. **Focus.** Flaky tests whose cause is still unclear get extra trials running only those tests,
+   in batches. Each batch is followed by another check, and tests drop out as soon as their cause
+   is clear.
+5. **Store.** Every trial is saved to SQLite, so any run can be re-reported or scored later.
 
 ## Layout
 
 ```
 main.go             commands and flags
+internal/campaign   one run end to end: detect, replays, polluter search, focus
 internal/runner     running trials: docker, service + toxiproxy, pytest, junit parsing
 internal/analysis   counting results, statistics, causes, polluter search, scoring
 internal/store      sqlite storage and migrations
@@ -114,19 +140,37 @@ flaky-zoo/          tests with known causes, used as a benchmark
   100% of the time with 5 workers but 0% with 1. Pinning makes the CPU limit the only variable.
 - **Balanced conditions.** Every CPU and latency combination gets the same number of trials, so
   the two are independent and each can be tested on its own.
-- **Permutation test instead of chi-square.** Counts per level are small (10 to 45 trials), which is
-  where the textbook approximations get unreliable.
-- **Toxiproxy per trial.** A shared proxy would let one trial's latency affect another's.
+- **Permutation test instead of chi-square.** Counts per level are small (10 to 50 trials), which
+  is where the textbook approximations get unreliable.
+- **Early stopping without extra false positives.** Checking after every focus batch and stopping
+  when something looks significant gives chance more tries. The first version split the threshold
+  evenly across checks (Bonferroni) and missed a real CPU effect. It now uses a Haybittle-Peto
+  boundary: early checks need p < 0.001 to stop, and the final check uses 0.047, which keeps the
+  overall false positive rate at 5%.
+- **Stratified trend test.** A test can fail at a different base rate when it runs alone in a focus
+  trial than in the full suite. Mixing the two blurred the CPU comparison, so failures are only
+  shuffled within each kind of trial.
+- **Seed evidence beats a chance trend.** Conditions are assigned at random, independently of seeds.
+  So if a test's failing seed fails every rerun with no limits, any CPU or latency trend for it can
+  only be chance. Those tests are labelled from the polluter search, with the trend as a note.
+- **Honest "stable".** Passing every one of n runs only rules out failure rates above roughly 3/n,
+  so every report says what rate the run could have caught.
+- **Toxiproxy per trial, only when needed.** A shared proxy would let one trial's latency affect
+  another's. Trials with no added latency connect to the service directly, one container fewer.
 - **Migrations.** Old db files upgrade on open (`PRAGMA user_version`) instead of breaking.
 
 ## Limitations
 
 - pytest only.
+- Catching rare flakiness takes a lot of full-suite trials: 59 for a test that fails 5% of the time,
+  299 for 1% (at 95% probability).
 - Network faults need the tests to read the service address from config (like `DATABASE_URL`).
 - On laptops with mixed fast and slow cores and no fan, parallel trials still affect each other's
   speed even when pinned, so CPU results compare levels within a run rather than exact timings.
 - The polluter search assumes one test is enough to break the victim. If it takes several together,
   it says so instead of guessing.
+- A test with two separate problems, like an order dependency and a timing race, is reported as
+  order-dependent, with the timing trend treated as chance.
 - Tests that fail when run twice in the same process (NIO in the IDoFT dataset) aren't detected,
   since each trial runs each test once.
 
@@ -134,7 +178,7 @@ flaky-zoo/          tests with known causes, used as a benchmark
 
 ```
 cd flaky-zoo && docker build -t flaky-zoo . && cd ..
-./flaky-zoo/run.sh --runs 135
+./flaky-zoo/run.sh
 ./flakehunt score <run id>
 ```
 
@@ -146,8 +190,8 @@ go test -race ./...
 
 ## Status
 
-Done: detection, cause analysis, polluter search, network faults, markdown reports, scoring.
+Done: detection, cause analysis, polluter search, network faults, adaptive sampling, markdown
+reports, scoring.
 
-Next: adaptive sampling (stop rerunning tests that are clearly stable), running on real
-open source projects and scoring against [IDoFT](https://github.com/TestingResearchIllinois/idoft),
-CI, and releases.
+Next: more zoo tests (time/date, hangs), running on real open source projects and scoring
+against [IDoFT](https://github.com/TestingResearchIllinois/idoft), CI, and releases.

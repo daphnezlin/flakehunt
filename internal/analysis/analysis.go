@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"sort"
@@ -193,13 +194,22 @@ func classify(c Cause) (label, detail string) {
 	cpu := c.CPUSensitive()
 	net := c.NetworkSensitive()
 	replayed := c.Replays.Runs > 0
-	seed := replayed && c.Replays.Failures == c.Replays.Runs
+	seed := c.SeedDetermined()
 
 	switch {
+	case seed && c.Polluter != nil:
+		// the seed reproduced every failure with no cpu limit or latency, and
+		// conditions are assigned at random, independently of the seed. so a
+		// cpu or latency trend on top of that can only be chance: note it,
+		// but go with what the replays and polluter search showed
+		label, detail := classifySeed(*c.Polluter)
+		if cpu || net {
+			detail += fmt.Sprintf(" (it also failed more with %s, likely chance since the seed alone reproduces every failure)",
+				trendName(cpu, net))
+		}
+		return label, detail
 	case seed && (cpu || net):
 		return "seed + timing", "fails every time with this seed, and also fails more with less cpu or a slower network"
-	case seed && c.Polluter != nil:
-		return classifySeed(*c.Polluter)
 	case seed:
 		return "seed-dependent", "fails every time with the same seed, so it depends on test order or random data, not timing"
 	case cpu && net:
@@ -226,6 +236,23 @@ func classifySeed(p PolluterResult) (label, detail string) {
 		return "order-dependent", "passes on its own but fails in the full run order (" + p.Note + ")"
 	default:
 		return "order-dependent", "passes on its own but fails in the full run order"
+	}
+}
+
+// SeedDetermined is true when rerunning the failing seed failed every time,
+// i.e. test order or random data alone is enough to make it fail.
+func (c Cause) SeedDetermined() bool {
+	return c.Replays.Runs > 0 && c.Replays.Failures == c.Replays.Runs
+}
+
+func trendName(cpu, net bool) string {
+	switch {
+	case cpu && net:
+		return "less cpu and more latency"
+	case cpu:
+		return "less cpu"
+	default:
+		return "more latency"
 	}
 }
 

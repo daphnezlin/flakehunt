@@ -105,6 +105,9 @@ func Print(agg *analysis.Aggregate, causes []analysis.Cause, image string, env [
 		fmt.Printf("\n%d trials had infrastructure errors, %d timed out (excluded from rates)\n",
 			agg.InfraFails, agg.Timeouts)
 	}
+	if line := Sensitivity(agg); line != "" {
+		fmt.Printf("\n%s\n", line)
+	}
 	if len(flaky) == 0 {
 		fmt.Println("\nNo flaky tests found.")
 		return
@@ -177,7 +180,11 @@ func WriteMarkdown(w io.Writer, run store.RunInfo, agg *analysis.Aggregate, caus
 	if agg.InfraFails > 0 || agg.Timeouts > 0 {
 		fmt.Fprintf(&b, "- **Excluded:** %d trials with infrastructure errors, %d timed out\n", agg.InfraFails, agg.Timeouts)
 	}
-	fmt.Fprintf(&b, "- **Result:** %d of %d tests are flaky\n\n", len(flaky), len(sorted))
+	fmt.Fprintf(&b, "- **Result:** %d of %d tests are flaky\n", len(flaky), len(sorted))
+	if line := Sensitivity(agg); line != "" {
+		fmt.Fprintf(&b, "- **Detection:** %s\n", line)
+	}
+	b.WriteString("\n")
 
 	if len(flaky) == 0 {
 		b.WriteString("No flaky tests found.\n")
@@ -353,4 +360,18 @@ func FormatLevels(ls []float64) string {
 		parts[i] = formatLevel(l)
 	}
 	return strings.Join(parts, ", ")
+}
+
+// Sensitivity says how rare a flaky test could be and still slip through as
+// "stable". Passing every one of n runs only rules out failure rates above a
+// certain level, so the report shouldn't claim more than that.
+func Sensitivity(agg *analysis.Aggregate) string {
+	n := agg.StableRuns()
+	if n == 0 {
+		return ""
+	}
+	rate := analysis.CatchableRate(n, 0.95)
+	return fmt.Sprintf("tests marked stable passed all %d runs, so one failing more than %.1f%% of the time "+
+		"had a 95%% chance of being caught. Rarer flakiness can still hide (--catch-rate to look harder).",
+		n, 100*rate)
 }

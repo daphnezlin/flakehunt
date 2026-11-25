@@ -185,3 +185,19 @@ func TestFinalAlpha(t *testing.T) {
 		t.Errorf("FinalAlpha(3) = %v", got)
 	}
 }
+
+func TestSeedBeatsChanceTrend(t *testing.T) {
+	// like run 15: the seed reproduced every failure, and the polluter search
+	// found the culprit, but the cpu trend came out significant by chance
+	c := Cause{CPUTested: true, CPUq: 0.035, Alpha: 0.047, Replays: Count{Runs: 5, Failures: 5},
+		Polluter: &PolluterResult{Polluter: "m::test_create"}}
+	label, detail := classify(c)
+	if label != "order-dependent" || !strings.Contains(detail, "test_create") || !strings.Contains(detail, "likely chance") {
+		t.Errorf("got %q: %q", label, detail)
+	}
+	// without a trend, no note
+	c.CPUq = 0.5
+	if _, detail := classify(c); strings.Contains(detail, "chance") {
+		t.Errorf("unexpected note: %q", detail)
+	}
+}
