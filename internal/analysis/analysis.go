@@ -1,4 +1,4 @@
-package main
+package analysis
 
 import (
 	"math"
@@ -146,8 +146,8 @@ func Analyze(agg *Aggregate, replays map[string]*Count, polluters map[string]Pol
 }
 
 func classify(c Cause) (label, detail string) {
-	cpu := c.CPUTested && c.CPUq < alpha
-	net := c.NetTested && c.NetQ < alpha
+	cpu := c.CPUSensitive()
+	net := c.NetworkSensitive()
 	replayed := c.Replays.Runs > 0
 	seed := replayed && c.Replays.Failures == c.Replays.Runs
 
@@ -183,4 +183,17 @@ func classifySeed(p PolluterResult) (label, detail string) {
 	default:
 		return "order-dependent", "passes on its own but fails in the full run order"
 	}
+}
+
+// CPUSensitive and NetworkSensitive are true when the trend test found a real effect.
+func (c Cause) CPUSensitive() bool     { return c.CPUTested && c.CPUq < alpha }
+func (c Cause) NetworkSensitive() bool { return c.NetTested && c.NetQ < alpha }
+
+// CausesByName indexes causes by test name.
+func CausesByName(causes []Cause) map[string]*Cause {
+	m := map[string]*Cause{}
+	for i := range causes {
+		m[causes[i].Test] = &causes[i]
+	}
+	return m
 }

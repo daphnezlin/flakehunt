@@ -1,13 +1,14 @@
-package main
+package analysis
 
 import (
+	"github.com/daphnezlin/flakehunt/internal/runner"
 	"os"
 	"path/filepath"
 	"testing"
 )
 
 func TestScoreAllCorrect(t *testing.T) {
-	_, agg, causes := zooRun()
+	agg, causes := zooResults()
 	exp := map[string]Expected{
 		"m::test_empty":  {Cause: "order-dependent", Polluter: "m::test_create"},
 		"m::test_api":    {Cause: "network"},
@@ -28,7 +29,7 @@ func TestScoreAllCorrect(t *testing.T) {
 }
 
 func TestScoreMistakes(t *testing.T) {
-	_, agg, causes := zooRun()
+	agg, causes := zooResults()
 	exp := map[string]Expected{
 		"m::test_empty":   {Cause: "order-dependent", Polluter: "m::someone_else"}, // wrong polluter
 		"m::test_api":     {Cause: "timing"},                                       // wrong cause
@@ -61,4 +62,27 @@ func TestLoadExpected(t *testing.T) {
 	if exp["a::b"].Polluter != "a::c" || exp["a::d"].Cause != "stable" {
 		t.Errorf("got %+v", exp)
 	}
+}
+
+// zooResults is shaped like the flaky zoo: an order-dependent test with a
+// known polluter, a network test, and two stable tests.
+func zooResults() (*Aggregate, []Cause) {
+	agg := NewAggregate()
+	for _, cpu := range []float64{0, 0.5} {
+		for _, lat := range []int{0, 150} {
+			for i := 0; i < 10; i++ {
+				agg.Add(runner.TrialResult{Trial: runner.Trial{Seed: int64(i), CPUs: cpu, LatencyMS: lat}, Tests: []runner.TestOutcome{
+					{Name: "m::test_create", NodeID: "t.py::test_create"},
+					{Name: "m::test_empty", NodeID: "t.py::test_empty", Failed: i%2 == 0},
+					{Name: "m::test_api", NodeID: "t.py::test_api", Failed: lat == 150 && i < 8},
+					{Name: "m::test_ok", NodeID: "t.py::test_ok"},
+				}})
+			}
+		}
+	}
+	replays := map[string]*Count{"m::test_empty": {Runs: 5, Failures: 5}, "m::test_api": {Runs: 5}}
+	polluters := map[string]PolluterResult{"m::test_empty": {
+		Polluter: "m::test_create", PolluterNode: "t.py::test_create", VictimNode: "t.py::test_empty", Probes: 3,
+	}}
+	return agg, Analyze(agg, replays, polluters)
 }

@@ -1,6 +1,9 @@
-package main
+package report
 
 import (
+	"github.com/daphnezlin/flakehunt/internal/analysis"
+	"github.com/daphnezlin/flakehunt/internal/runner"
+	"github.com/daphnezlin/flakehunt/internal/store"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,13 +13,13 @@ import (
 
 // zooRun builds results shaped like the flaky zoo: an order-dependent test
 // with a known polluter, a network test, and a stable test.
-func zooRun() (RunInfo, *Aggregate, []Cause) {
-	agg := NewAggregate()
+func zooRun() (store.RunInfo, *analysis.Aggregate, []analysis.Cause) {
+	agg := analysis.NewAggregate()
 	for _, cpu := range []float64{0, 0.5} {
 		for _, lat := range []int{0, 150} {
 			for i := 0; i < 10; i++ {
 				seed := int64(100*int(cpu*10) + lat + i)
-				agg.Add(TrialResult{Trial: Trial{Seed: seed, CPUs: cpu, LatencyMS: lat}, Tests: []TestOutcome{
+				agg.Add(runner.TrialResult{Trial: runner.Trial{Seed: seed, CPUs: cpu, LatencyMS: lat}, Tests: []runner.TestOutcome{
 					{Name: "m::test_create", NodeID: "t.py::test_create"},
 					{Name: "m::test_empty", NodeID: "t.py::test_empty", Failed: i%2 == 0},
 					{Name: "m::test_api", NodeID: "t.py::test_api", Failed: lat == 150 && i < 8},
@@ -25,13 +28,13 @@ func zooRun() (RunInfo, *Aggregate, []Cause) {
 			}
 		}
 	}
-	replays := map[string]*Count{"m::test_empty": {Runs: 5, Failures: 5}, "m::test_api": {Runs: 5}}
-	polluters := map[string]PolluterResult{"m::test_empty": {
+	replays := map[string]*analysis.Count{"m::test_empty": {Runs: 5, Failures: 5}, "m::test_api": {Runs: 5}}
+	polluters := map[string]analysis.PolluterResult{"m::test_empty": {
 		Polluter: "m::test_create", PolluterNode: "t.py::test_create", VictimNode: "t.py::test_empty", Probes: 3,
 	}}
-	run := RunInfo{ID: 8, StartedAt: time.Now(), Image: "zoo", Workers: 5, BaseSeed: 42,
+	run := store.RunInfo{ID: 8, StartedAt: time.Now(), Image: "zoo", Workers: 5, BaseSeed: 42,
 		CPULevels: []float64{0, 0.5}, LatencyLevels: []int{0, 150}, Service: "api", Env: []string{"A=1"}}
-	return run, agg, Analyze(agg, replays, polluters)
+	return run, agg, analysis.Analyze(agg, replays, polluters)
 }
 
 func TestWriteMarkdown(t *testing.T) {
@@ -70,10 +73,10 @@ func TestWriteMarkdown(t *testing.T) {
 }
 
 func TestWriteMarkdownNoFlaky(t *testing.T) {
-	agg := NewAggregate()
-	agg.Add(TrialResult{Trial: Trial{}, Tests: []TestOutcome{{Name: "m::ok"}}})
+	agg := analysis.NewAggregate()
+	agg.Add(runner.TrialResult{Trial: runner.Trial{}, Tests: []runner.TestOutcome{{Name: "m::ok"}}})
 	var b strings.Builder
-	if err := WriteMarkdown(&b, RunInfo{ID: 1, Image: "x"}, agg, nil); err != nil {
+	if err := WriteMarkdown(&b, store.RunInfo{ID: 1, Image: "x"}, agg, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(b.String(), "No flaky tests found") {
@@ -84,7 +87,7 @@ func TestWriteMarkdownNoFlaky(t *testing.T) {
 func TestWriteMarkdownFile(t *testing.T) {
 	run, agg, causes := zooRun()
 	dir := t.TempDir()
-	path, err := writeMarkdownFile(filepath.Join(dir, "reports", "run-{id}.md"), run, agg, causes)
+	path, err := WriteMarkdownFile(filepath.Join(dir, "reports", "run-{id}.md"), run, agg, causes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,14 +100,14 @@ func TestWriteMarkdownFile(t *testing.T) {
 }
 
 func TestReproForLatency(t *testing.T) {
-	s := &TestStats{Failing: []Trial{{Seed: 5, CPUs: 0.5, LatencyMS: 150}}}
-	network := &Cause{NetTested: true, NetQ: 0.001}
+	s := &analysis.TestStats{Failing: []runner.Trial{{Seed: 5, CPUs: 0.5, LatencyMS: 150}}}
+	network := &analysis.Cause{NetTested: true, NetQ: 0.001}
 	r := reproFor(s, network, "zoo", nil)
 	if !strings.Contains(r.Cmd, "--cpus 0.5") || !strings.Contains(r.Note, "--latency-levels 150") || r.Minimal {
 		t.Errorf("got %+v", r)
 	}
 	// a timing test that happened to fail with latency shouldn't point at the network
-	timing := &Cause{NetTested: true, NetQ: 0.8, CPUTested: true, CPUq: 0.001}
+	timing := &analysis.Cause{NetTested: true, NetQ: 0.8, CPUTested: true, CPUq: 0.001}
 	if r := reproFor(s, timing, "zoo", nil); r.Note != "" {
 		t.Errorf("latency note on a non-network test: %q", r.Note)
 	}

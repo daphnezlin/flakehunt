@@ -3,6 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/daphnezlin/flakehunt/internal/analysis"
+	"github.com/daphnezlin/flakehunt/internal/report"
+	"github.com/daphnezlin/flakehunt/internal/runner"
+	"github.com/daphnezlin/flakehunt/internal/store"
 	"os"
 	"os/signal"
 	"runtime"
@@ -36,7 +40,7 @@ func runCmd() *cobra.Command {
 		workers   int
 		cpuLevels []float64
 		latencies []int
-		svc       ServiceConfig
+		svc       runner.ServiceConfig
 		svcCmd    string
 		toxiImage string
 		replays   int
@@ -55,13 +59,13 @@ func runCmd() *cobra.Command {
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 			defer stop()
 
-			store, err := OpenStore(dbPath)
+			db, err := store.OpenStore(dbPath)
 			if err != nil {
 				return err
 			}
-			defer store.Close()
+			defer db.Close()
 
-			var service *ServiceConfig
+			var service *runner.ServiceConfig
 			if svc.Image != "" {
 				svc.Cmd = strings.Fields(svcCmd)
 				service = &svc
@@ -74,12 +78,12 @@ func runCmd() *cobra.Command {
 				latencies = nil
 			}
 
-			runner, err := NewDockerRunner(ctx, image, outDir, env, workers, timeout, service, toxiImage)
+			dr, err := runner.NewDockerRunner(ctx, image, outDir, env, workers, timeout, service, toxiImage)
 			if err != nil {
 				return err
 			}
 
-			runID, err := store.CreateRun(RunInfo{
+			runID, err := db.CreateRun(store.RunInfo{
 				StartedAt: time.Now(), Image: image, BaseSeed: baseSeed, Workers: workers,
 				CPULevels: cpuLevels, LatencyLevels: latencies, Service: svc.Image, Env: env,
 			})
@@ -88,20 +92,20 @@ func runCmd() *cobra.Command {
 			}
 
 			// everything comes from one base seed so a whole run is reproducible
-			trials := MakeTrials(runs, cpuLevels, latencies, baseSeed)
+			trials := runner.MakeTrials(runs, cpuLevels, latencies, baseSeed)
 
 			fmt.Fprintf(os.Stderr, "run #%d: %d trials of %s with %d workers, cpu levels %s",
-				runID, runs, image, workers, formatLevels(cpuLevels))
+				runID, runs, image, workers, report.FormatLevels(cpuLevels))
 			if service != nil {
-				fmt.Fprintf(os.Stderr, ", latency %s (service %s)", formatLatencies(latencies), svc.Image)
+				fmt.Fprintf(os.Stderr, ", latency %s (service %s)", report.FormatLatencies(latencies), svc.Image)
 			}
 			fmt.Fprintf(os.Stderr, " (base seed %d)\n", baseSeed)
 			start := time.Now()
 
 			// results are only handled here, so this loop is the single db writer
-			agg := NewAggregate()
-			for res := range RunAll(ctx, runner, trials, workers) {
-				if err := store.SaveTrial(runID, res); err != nil {
+			agg := analysis.NewAggregate()
+			for res := range runner.RunAll(ctx, dr, trials, workers) {
+				if err := db.SaveTrial(runID, res); err != nil {
 					return fmt.Errorf("save trial %d: %w", res.Trial.ID, err)
 				}
 				agg.Add(res)
@@ -113,17 +117,17 @@ func runCmd() *cobra.Command {
 			fmt.Fprintf(os.Stderr, "\n  finished in %s\n", time.Since(start).Round(time.Second))
 
 			lastID := len(trials) // replays and probes get ids after the normal trials
-			var replayCounts map[string]*Count
+			var replayCounts map[string]*analysis.Count
 			if ctx.Err() == nil && replays > 0 {
-				replayCounts, lastID, err = runReplays(ctx, store, runID, runner, agg, replays, workers, lastID)
+				replayCounts, lastID, err = runReplays(ctx, db, runID, dr, agg, replays, workers, lastID)
 				if err != nil {
 					return err
 				}
 			}
 
-			var found map[string]PolluterResult
+			var found map[string]analysis.PolluterResult
 			if ctx.Err() == nil && polluters {
-				found, err = runPolluterSearch(ctx, store, runID, runner, agg, replayCounts, lastID)
+				found, err = runPolluterSearch(ctx, db, runID, dr, agg, replayCounts, lastID)
 				if err != nil {
 					return err
 				}
@@ -132,20 +136,20 @@ func runCmd() *cobra.Command {
 
 			if ctx.Err() != nil {
 				fmt.Fprintf(os.Stderr, "interrupted, run #%d has partial results\n\n", runID)
-			} else if err := store.FinishRun(runID); err != nil {
+			} else if err := db.FinishRun(runID); err != nil {
 				return err
 			}
 
-			causes := Analyze(agg, replayCounts, found)
-			printReport(agg, causes, image, env)
+			causes := analysis.Analyze(agg, replayCounts, found)
+			report.Print(agg, causes, image, env)
 			fmt.Printf("\nsaved as run #%d in %s (see it again with: %s report %d)\n", runID, dbPath, os.Args[0], runID)
 
 			if markdown != "" {
-				run, err := store.GetRun(runID)
+				run, err := db.GetRun(runID)
 				if err != nil {
 					return err
 				}
-				path, err := writeMarkdownFile(markdown, run, agg, causes)
+				path, err := report.WriteMarkdownFile(markdown, run, agg, causes)
 				if err != nil {
 					return fmt.Errorf("write markdown report: %w", err)
 				}
@@ -181,17 +185,17 @@ func runCmd() *cobra.Command {
 // runReplays reruns each flaky test's first failing seed with no cpu limit.
 // If it fails every time, the seed (test order or random data) is enough to
 // cause it. If it sometimes passes, something else like timing is involved.
-func runReplays(ctx context.Context, store *Store, runID int64, runner Runner, agg *Aggregate,
-	per, workers, lastID int) (map[string]*Count, int, error) {
+func runReplays(ctx context.Context, db *store.Store, runID int64, rn runner.Runner, agg *analysis.Aggregate,
+	per, workers, lastID int) (map[string]*analysis.Count, int, error) {
 
-	var trials []Trial
+	var trials []runner.Trial
 	for _, s := range agg.Sorted() {
 		if !s.Flaky() {
 			continue
 		}
 		for i := 0; i < per; i++ {
 			lastID++
-			trials = append(trials, Trial{ID: lastID, Seed: s.Failing[0].Seed, ReplayFor: s.Name})
+			trials = append(trials, runner.Trial{ID: lastID, Seed: s.Failing[0].Seed, ReplayFor: s.Name})
 		}
 	}
 	if len(trials) == 0 {
@@ -199,10 +203,10 @@ func runReplays(ctx context.Context, store *Store, runID int64, runner Runner, a
 	}
 
 	fmt.Fprintf(os.Stderr, "  replaying failing seeds\n")
-	counts := map[string]*Count{}
+	counts := map[string]*analysis.Count{}
 	done := 0
-	for res := range RunAll(ctx, runner, trials, workers) {
-		if err := store.SaveTrial(runID, res); err != nil {
+	for res := range runner.RunAll(ctx, rn, trials, workers) {
+		if err := db.SaveTrial(runID, res); err != nil {
 			return nil, lastID, fmt.Errorf("save replay %d: %w", res.Trial.ID, err)
 		}
 		done++
@@ -215,7 +219,7 @@ func runReplays(ctx context.Context, store *Store, runID int64, runner Runner, a
 			}
 			c := counts[o.Name]
 			if c == nil {
-				c = &Count{}
+				c = &analysis.Count{}
 				counts[o.Name] = c
 			}
 			c.Runs++
@@ -231,20 +235,20 @@ func runReplays(ctx context.Context, store *Store, runID int64, runner Runner, a
 // runPolluterSearch runs FindPolluter for every test whose failing seed failed
 // every replay. Searches run one probe at a time since each step depends on the
 // last one. lastID is the highest trial id used so far.
-func runPolluterSearch(ctx context.Context, store *Store, runID int64, runner Runner, agg *Aggregate,
-	replays map[string]*Count, lastID int) (map[string]PolluterResult, error) {
+func runPolluterSearch(ctx context.Context, db *store.Store, runID int64, rn runner.Runner, agg *analysis.Aggregate,
+	replays map[string]*analysis.Count, lastID int) (map[string]analysis.PolluterResult, error) {
 
-	found := map[string]PolluterResult{}
+	found := map[string]analysis.PolluterResult{}
 	nextID := lastID
-	for _, c := range Analyze(agg, replays, nil) {
+	for _, c := range analysis.Analyze(agg, replays, nil) {
 		if c.Label != "seed-dependent" {
 			continue
 		}
 		s := agg.Tests[c.Test]
 		seed := s.Failing[0].Seed
 
-		var victim TestOutcome
-		var before []TestOutcome
+		var victim runner.TestOutcome
+		var before []runner.TestOutcome
 		for i, o := range s.FirstFailure {
 			if o.Name == c.Test {
 				victim, before = o, s.FirstFailure[:i]
@@ -259,8 +263,8 @@ func runPolluterSearch(ctx context.Context, store *Store, runID int64, runner Ru
 				return false, false, ctx.Err()
 			}
 			nextID++
-			res := runner.Run(ctx, Trial{ID: nextID, Seed: seed, ReplayFor: c.Test, Probe: "polluter", Tests: nodeIDs})
-			if err := store.SaveTrial(runID, res); err != nil {
+			res := rn.Run(ctx, runner.Trial{ID: nextID, Seed: seed, ReplayFor: c.Test, Probe: "polluter", Tests: nodeIDs})
+			if err := db.SaveTrial(runID, res); err != nil {
 				saveErr = err
 				return false, false, err
 			}
@@ -278,11 +282,11 @@ func runPolluterSearch(ctx context.Context, store *Store, runID int64, runner Ru
 			return false, false, nil
 		}
 
-		result := FindPolluter(victim, before, probe)
+		result := analysis.FindPolluter(victim, before, probe)
 		if saveErr != nil {
 			return nil, fmt.Errorf("save probe: %w", saveErr)
 		}
-		if err := store.SavePolluter(runID, c.Test, result); err != nil {
+		if err := db.SavePolluter(runID, c.Test, result); err != nil {
 			return nil, err
 		}
 		found[c.Test] = result
@@ -295,13 +299,13 @@ func runsCmd() *cobra.Command {
 		Use:   "runs",
 		Short: "List saved runs",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			store, err := OpenStore(dbPath)
+			db, err := store.OpenStore(dbPath)
 			if err != nil {
 				return err
 			}
-			defer store.Close()
+			defer db.Close()
 
-			runs, err := store.ListRuns()
+			runs, err := db.ListRuns()
 			if err != nil {
 				return err
 			}
@@ -318,7 +322,7 @@ func runsCmd() *cobra.Command {
 				}
 				fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%d\t%s\t%s\t%s\n",
 					r.ID, r.StartedAt.Local().Format("2006-01-02 15:04"), r.Image, r.Trials, r.Workers,
-					formatLevels(r.CPULevels), formatLatencies(r.LatencyLevels), status)
+					report.FormatLevels(r.CPULevels), report.FormatLatencies(r.LatencyLevels), status)
 			}
 			return w.Flush()
 		},
@@ -339,32 +343,32 @@ func reportCmd() *cobra.Command {
 				return fmt.Errorf("run id should be a number, got %q", args[0])
 			}
 
-			store, err := OpenStore(dbPath)
+			db, err := store.OpenStore(dbPath)
 			if err != nil {
 				return err
 			}
-			defer store.Close()
+			defer db.Close()
 
-			run, err := store.GetRun(runID)
+			run, err := db.GetRun(runID)
 			if err != nil {
 				return err
 			}
-			agg, err := store.LoadAggregate(runID)
+			agg, err := db.LoadAggregate(runID)
 			if err != nil {
 				return err
 			}
-			replays, err := store.LoadReplays(runID)
+			replays, err := db.LoadReplays(runID)
 			if err != nil {
 				return err
 			}
-			polluters, err := store.LoadPolluters(runID)
+			polluters, err := db.LoadPolluters(runID)
 			if err != nil {
 				return err
 			}
-			causes := Analyze(agg, replays, polluters)
+			causes := analysis.Analyze(agg, replays, polluters)
 
 			if markdown != "" {
-				path, err := writeMarkdownFile(markdown, run, agg, causes)
+				path, err := report.WriteMarkdownFile(markdown, run, agg, causes)
 				if err != nil {
 					return fmt.Errorf("write markdown report: %w", err)
 				}
@@ -373,7 +377,7 @@ func reportCmd() *cobra.Command {
 			}
 			fmt.Printf("run #%d, %s, %d trials, %d workers\n\n",
 				run.ID, run.StartedAt.Local().Format("2006-01-02 15:04"), agg.Trials, run.Workers)
-			printReport(agg, causes, run.Image, run.Env)
+			report.Print(agg, causes, run.Image, run.Env)
 			return nil
 		},
 	}
@@ -390,17 +394,17 @@ func scoreCmd() *cobra.Command {
 		Short: "Check saved runs against known causes, e.g. the flaky zoo",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			expected, err := LoadExpected(expectedPath)
+			expected, err := analysis.LoadExpected(expectedPath)
 			if err != nil {
 				return err
 			}
-			store, err := OpenStore(dbPath)
+			db, err := store.OpenStore(dbPath)
 			if err != nil {
 				return err
 			}
-			defer store.Close()
+			defer db.Close()
 
-			var total ScoreSummary
+			var total analysis.ScoreSummary
 			right := map[string]int{} // runs where each test was scored correctly
 			got := map[string][]string{}
 			for _, arg := range args {
@@ -408,20 +412,20 @@ func scoreCmd() *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("run id should be a number, got %q", arg)
 				}
-				agg, err := store.LoadAggregate(runID)
+				agg, err := db.LoadAggregate(runID)
 				if err != nil {
 					return err
 				}
-				replays, err := store.LoadReplays(runID)
+				replays, err := db.LoadReplays(runID)
 				if err != nil {
 					return err
 				}
-				polluters, err := store.LoadPolluters(runID)
+				polluters, err := db.LoadPolluters(runID)
 				if err != nil {
 					return err
 				}
-				verdicts := Score(agg, Analyze(agg, replays, polluters), expected)
-				total.Add(Summarize(verdicts, expected))
+				verdicts := analysis.Score(agg, analysis.Analyze(agg, replays, polluters), expected)
+				total.Add(analysis.Summarize(verdicts, expected))
 				for _, v := range verdicts {
 					if v.Correct {
 						right[v.Test]++
@@ -484,4 +488,11 @@ func summarizeLabels(labels []string) string {
 		}
 	}
 	return strings.Join(parts, ", ")
+}
+
+func pct(a, b int) string {
+	if b == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.0f%%", 100*float64(a)/float64(b))
 }

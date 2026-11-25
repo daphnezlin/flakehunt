@@ -1,4 +1,4 @@
-package main
+package analysis
 
 import (
 	"encoding/json"
@@ -36,7 +36,7 @@ type Verdict struct {
 
 // Score checks every test in the run and in the expected file.
 func Score(agg *Aggregate, causes []Cause, expected map[string]Expected) []Verdict {
-	byName := causesByName(causes)
+	byName := CausesByName(causes)
 	names := map[string]bool{}
 	for n := range agg.Tests {
 		names[n] = true
@@ -134,11 +134,4 @@ func (s *ScoreSummary) Add(o ScoreSummary) {
 	s.Polluted += o.Polluted
 	s.Unexpected += o.Unexpected
 	s.NotRun += o.NotRun
-}
-
-func pct(a, b int) string {
-	if b == 0 {
-		return "-"
-	}
-	return fmt.Sprintf("%.0f%%", 100*float64(a)/float64(b))
 }

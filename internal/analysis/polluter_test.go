@@ -1,15 +1,17 @@
-package main
+package analysis
 
 import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/daphnezlin/flakehunt/internal/runner"
 )
 
-func outcomes(names ...string) []TestOutcome {
-	out := make([]TestOutcome, len(names))
+func outcomes(names ...string) []runner.TestOutcome {
+	out := make([]runner.TestOutcome, len(names))
 	for i, n := range names {
-		out[i] = TestOutcome{Name: n, NodeID: "t.py::" + n}
+		out[i] = runner.TestOutcome{Name: n, NodeID: "t.py::" + n}
 	}
 	return out
 }
@@ -70,34 +72,8 @@ func TestFindPolluterCantReproduce(t *testing.T) {
 }
 
 func TestFindPolluterNoNodeID(t *testing.T) {
-	res := FindPolluter(TestOutcome{Name: "victim"}, nil, nil)
+	res := FindPolluter(runner.TestOutcome{Name: "victim"}, nil, nil)
 	if res.Note == "" || res.Probes != 0 {
 		t.Errorf("got %+v", res)
-	}
-}
-
-func TestNodeID(t *testing.T) {
-	cases := []struct{ file, class, name, want string }{
-		{"tests/test_order.py", "tests.test_order", "test_x", "tests/test_order.py::test_x"},
-		{"tests/test_db.py", "tests.test_db.TestUsers", "test_add", "tests/test_db.py::TestUsers::test_add"},
-		{"test_a.py", "test_a.TestOuter.TestInner", "test_b[1-2]", "test_a.py::TestOuter::TestInner::test_b[1-2]"},
-		{"", "tests.test_x", "test_y", ""},
-	}
-	for _, c := range cases {
-		if got := NodeID(c.file, c.class, c.name); got != c.want {
-			t.Errorf("NodeID(%q, %q, %q) = %q, want %q", c.file, c.class, c.name, got, c.want)
-		}
-	}
-}
-
-func TestPytestArgs(t *testing.T) {
-	whole := strings.Join(PytestArgs(Trial{Seed: 7}, "/r/j.xml"), " ")
-	if !strings.Contains(whole, "--randomly-seed=7") || strings.Contains(whole, "dont-reorganize") {
-		t.Errorf("whole suite args: %s", whole)
-	}
-	picked := PytestArgs(Trial{Seed: 7, Tests: []string{"a.py::x", "a.py::y"}}, "/r/j.xml")
-	n := len(picked)
-	if picked[n-3] != "--randomly-dont-reorganize" || picked[n-2] != "a.py::x" || picked[n-1] != "a.py::y" {
-		t.Errorf("picked args: %v", picked)
 	}
 }

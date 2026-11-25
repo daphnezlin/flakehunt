@@ -1,4 +1,4 @@
-package main
+package runner
 
 // ServiceConfig is a dependency the tests talk to (an api, a db...). Each trial
 // gets its own copy behind its own toxiproxy, on a private docker network:
