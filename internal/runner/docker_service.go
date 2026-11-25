@@ -84,15 +84,24 @@ func (d *DockerRunner) startService(ctx context.Context, t Trial) (netName strin
 	}
 	containers = append(containers, svc.ID)
 
-	// publish the api port on a random localhost port so flakehunt can configure it
-	proxy, err := d.cli.ContainerCreate(ctx,
-		&container.Config{Image: d.toxiproxyImage, Labels: labels, ExposedPorts: nat.PortSet{toxiproxyPort: {}}},
-		&container.HostConfig{NetworkMode: mode, PortBindings: nat.PortMap{toxiproxyPort: {{HostIP: "127.0.0.1"}}}},
-		onNet("toxiproxy"), nil, "")
-	if err != nil {
-		return "", nil, cleanup, fmt.Errorf("create toxiproxy: %w", err)
+	// with no latency there's nothing for toxiproxy to do, so tests talk to the
+	// service directly and the trial needs one less container. toxiproxy adds
+	// no delay of its own worth measuring, so it's the same condition
+	addr := "service:" + strconv.Itoa(d.service.Port)
+	var proxyID string
+	if t.LatencyMS > 0 {
+		// publish the api port on a random localhost port so flakehunt can configure it
+		proxy, err := d.cli.ContainerCreate(ctx,
+			&container.Config{Image: d.toxiproxyImage, Labels: labels, ExposedPorts: nat.PortSet{toxiproxyPort: {}}},
+			&container.HostConfig{NetworkMode: mode, PortBindings: nat.PortMap{toxiproxyPort: {{HostIP: "127.0.0.1"}}}},
+			onNet("toxiproxy"), nil, "")
+		if err != nil {
+			return "", nil, cleanup, fmt.Errorf("create toxiproxy: %w", err)
+		}
+		containers = append(containers, proxy.ID)
+		proxyID = proxy.ID
+		addr = proxyAddr
 	}
-	containers = append(containers, proxy.ID)
 
 	for _, id := range containers {
 		if err = d.cli.ContainerStart(ctx, id, container.StartOptions{}); err != nil {
@@ -100,37 +109,37 @@ func (d *DockerRunner) startService(ctx context.Context, t Trial) (netName strin
 		}
 	}
 
-	info, err := d.cli.ContainerInspect(ctx, proxy.ID)
-	if err != nil {
-		return "", nil, cleanup, err
-	}
-	bindings := info.NetworkSettings.Ports[toxiproxyPort]
-	if len(bindings) == 0 {
-		return "", nil, cleanup, fmt.Errorf("toxiproxy api port wasn't published")
-	}
-	tp := newToxiproxyClient("http://127.0.0.1:" + bindings[0].HostPort)
-
 	readyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if err = tp.waitReady(readyCtx); err != nil {
-		return "", nil, cleanup, err
-	}
 	if d.service.Health != "" {
 		if err = d.waitHealthy(readyCtx, svc.ID); err != nil {
 			return "", nil, cleanup, err
 		}
 	}
-	if err = tp.createProxy(ctx, "service", proxyListen, "service:"+strconv.Itoa(d.service.Port)); err != nil {
-		return "", nil, cleanup, err
-	}
-	if t.LatencyMS > 0 {
+
+	if proxyID != "" {
+		info, err := d.cli.ContainerInspect(ctx, proxyID)
+		if err != nil {
+			return "", nil, cleanup, err
+		}
+		bindings := info.NetworkSettings.Ports[toxiproxyPort]
+		if len(bindings) == 0 {
+			return "", nil, cleanup, fmt.Errorf("toxiproxy api port wasn't published")
+		}
+		tp := newToxiproxyClient("http://127.0.0.1:" + bindings[0].HostPort)
+		if err = tp.waitReady(readyCtx); err != nil {
+			return "", nil, cleanup, err
+		}
+		if err = tp.createProxy(ctx, "service", proxyListen, "service:"+strconv.Itoa(d.service.Port)); err != nil {
+			return "", nil, cleanup, err
+		}
 		if err = tp.addLatency(ctx, "service", t.LatencyMS, Jitter(t.LatencyMS)); err != nil {
 			return "", nil, cleanup, err
 		}
 	}
 
 	for _, e := range d.service.Env {
-		env = append(env, strings.ReplaceAll(e, "{addr}", proxyAddr))
+		env = append(env, strings.ReplaceAll(e, "{addr}", addr))
 	}
 	return netName, env, cleanup, nil
 }

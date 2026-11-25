@@ -76,6 +76,10 @@ var migrations = []string{
 	ALTER TABLE runs ADD COLUMN service TEXT NOT NULL DEFAULT '';
 	ALTER TABLE trials ADD COLUMN latency_ms INTEGER NOT NULL DEFAULT 0;
 	`,
+	// 6: significance threshold, stricter for runs that stop early
+	`
+	ALTER TABLE runs ADD COLUMN alpha REAL NOT NULL DEFAULT 0.05;
+	`,
 }
 
 type Store struct {
@@ -91,7 +95,8 @@ type RunInfo struct {
 	Workers       int
 	CPULevels     []float64
 	LatencyLevels []int
-	Service       string // service image, "" if none
+	Service       string  // service image, "" if none
+	Alpha         float64 // significance threshold the run's verdicts use
 	Env           []string
 	Trials        int // only filled in by ListRuns
 }
@@ -184,10 +189,10 @@ func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) CreateRun(r RunInfo) (int64, error) {
 	res, err := s.db.Exec(
-		`INSERT INTO runs (started_at, image, base_seed, workers, cpus, cpu_levels, latency_levels, service, env)
-		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)`,
+		`INSERT INTO runs (started_at, image, base_seed, workers, cpus, cpu_levels, latency_levels, service, alpha, env)
+		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
 		r.StartedAt.UTC().Format(time.RFC3339), r.Image, r.BaseSeed, r.Workers, joinFloats(r.CPULevels),
-		joinFloats(intsToFloats(r.LatencyLevels)), r.Service, strings.Join(r.Env, "\n"),
+		joinFloats(intsToFloats(r.LatencyLevels)), r.Service, alphaOrDefault(r.Alpha), strings.Join(r.Env, "\n"),
 	)
 	if err != nil {
 		return 0, err
@@ -275,9 +280,9 @@ func (s *Store) GetRun(runID int64) (RunInfo, error) {
 	var r RunInfo
 	var started, levels, latencies, env string
 	err := s.db.QueryRow(
-		`SELECT id, started_at, finished_at IS NOT NULL, image, base_seed, workers, cpu_levels, latency_levels, service, env
+		`SELECT id, started_at, finished_at IS NOT NULL, image, base_seed, workers, cpu_levels, latency_levels, service, alpha, env
 		FROM runs WHERE id = ?`, runID,
-	).Scan(&r.ID, &started, &r.Finished, &r.Image, &r.BaseSeed, &r.Workers, &levels, &latencies, &r.Service, &env)
+	).Scan(&r.ID, &started, &r.Finished, &r.Image, &r.BaseSeed, &r.Workers, &levels, &latencies, &r.Service, &r.Alpha, &env)
 	if err == sql.ErrNoRows {
 		return r, fmt.Errorf("no run with id %d", runID)
 	}
@@ -299,7 +304,7 @@ func (s *Store) LoadAggregate(runID int64) (*analysis.Aggregate, error) {
 	trials := map[int]*runner.TrialResult{}
 	var order []int
 
-	rows, err := s.db.Query(`SELECT trial_id, seed, cpus, latency_ms, cpuset, status, error FROM trials WHERE run_id = ? AND replay_for = '' ORDER BY trial_id`, runID)
+	rows, err := s.db.Query(`SELECT trial_id, seed, cpus, latency_ms, cpuset, probe, status, error FROM trials WHERE run_id = ? AND replay_for = '' ORDER BY trial_id`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -308,13 +313,13 @@ func (s *Store) LoadAggregate(runID int64) (*analysis.Aggregate, error) {
 		var seed int64
 		var cpus float64
 		var latency int
-		var cpuset, status string
+		var cpuset, probe, status string
 		var errMsg sql.NullString
-		if err := rows.Scan(&id, &seed, &cpus, &latency, &cpuset, &status, &errMsg); err != nil {
+		if err := rows.Scan(&id, &seed, &cpus, &latency, &cpuset, &probe, &status, &errMsg); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		tr := &runner.TrialResult{Trial: runner.Trial{ID: id, Seed: seed, CPUs: cpus, LatencyMS: latency}, CPUSet: cpuset}
+		tr := &runner.TrialResult{Trial: runner.Trial{ID: id, Seed: seed, CPUs: cpus, LatencyMS: latency, Probe: probe}, CPUSet: cpuset}
 		switch status {
 		case "timeout":
 			tr.TimedOut = true
@@ -414,4 +419,11 @@ func (s *Store) LoadPolluters(runID int64) (map[string]analysis.PolluterResult, 
 		out[test] = p
 	}
 	return out, rows.Err()
+}
+
+func alphaOrDefault(a float64) float64 {
+	if a == 0 {
+		return analysis.DefaultAlpha
+	}
+	return a
 }

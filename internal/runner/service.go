@@ -5,7 +5,8 @@ package runner
 //
 //	test container --> toxiproxy:8666 --(latency added here)--> service:<Port>
 //
-// so trials can't slow each other's network down.
+// so trials can't slow each other's network down. Trials with no added
+// latency skip toxiproxy and talk to the service directly.
 type ServiceConfig struct {
 	Image  string
 	Cmd    []string
