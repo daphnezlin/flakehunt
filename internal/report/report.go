@@ -1,7 +1,10 @@
-package main
+package report
 
 import (
 	"fmt"
+	"github.com/daphnezlin/flakehunt/internal/analysis"
+	"github.com/daphnezlin/flakehunt/internal/runner"
+	"github.com/daphnezlin/flakehunt/internal/store"
 	"io"
 	"os"
 	"path/filepath"
@@ -17,7 +20,7 @@ type repro struct {
 	Minimal bool   // only the tests needed, from the polluter search
 }
 
-func reproFor(s *TestStats, c *Cause, image string, env []string) repro {
+func reproFor(s *analysis.TestStats, c *analysis.Cause, image string, env []string) repro {
 	var envFlags strings.Builder
 	for _, e := range env {
 		envFlags.WriteString(" -e " + e)
@@ -45,7 +48,7 @@ func reproFor(s *TestStats, c *Cause, image string, env []string) repro {
 		cpuFlag = " --cpus " + formatLevel(t.CPUs)
 	}
 	r := repro{Cmd: fmt.Sprintf(base, cpuFlag)}
-	if t.LatencyMS > 0 && c != nil && c.NetTested && c.NetQ < alpha {
+	if t.LatencyMS > 0 && c != nil && c.NetworkSensitive() {
 		r.Note = fmt.Sprintf("failed with %dms latency to the service, which docker run alone won't add: "+
 			"rerun flakehunt with --latency-levels %d to reproduce", t.LatencyMS, t.LatencyMS)
 	}
@@ -78,12 +81,13 @@ func fixFor(label string) string {
 	}
 }
 
-func printReport(agg *Aggregate, causes []Cause, image string, env []string) {
+// Print writes the report to the terminal.
+func Print(agg *analysis.Aggregate, causes []analysis.Cause, image string, env []string) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "TEST\tFAILED\tRATE\t95% CI\tVERDICT")
-	var flaky []*TestStats
+	var flaky []*analysis.TestStats
 	for _, s := range agg.Sorted() {
-		low, high := Wilson(s.Failures, s.Runs)
+		low, high := analysis.Wilson(s.Failures, s.Runs)
 		verdict := "stable"
 		switch {
 		case s.Flaky():
@@ -133,7 +137,7 @@ func printReport(agg *Aggregate, causes []Cause, image string, env []string) {
 		}
 	}
 
-	byName := causesByName(causes)
+	byName := analysis.CausesByName(causes)
 	fmt.Println("\nReproduce (a trial where each flaky test failed):")
 	for _, s := range flaky {
 		r := reproFor(s, byName[s.Name], image, env)
@@ -147,24 +151,24 @@ func printReport(agg *Aggregate, causes []Cause, image string, env []string) {
 
 // WriteMarkdown writes a report meant to be read on GitHub. Each flaky test
 // gets its own section that can be pasted into an issue as is.
-func WriteMarkdown(w io.Writer, run RunInfo, agg *Aggregate, causes []Cause) error {
+func WriteMarkdown(w io.Writer, run store.RunInfo, agg *analysis.Aggregate, causes []analysis.Cause) error {
 	var b strings.Builder
 	sorted := agg.Sorted()
-	var flaky []*TestStats
+	var flaky []*analysis.TestStats
 	for _, s := range sorted {
 		if s.Flaky() {
 			flaky = append(flaky, s)
 		}
 	}
-	byName := causesByName(causes)
+	byName := analysis.CausesByName(causes)
 
 	fmt.Fprintf(&b, "# flakehunt report: run #%d\n\n", run.ID)
 	fmt.Fprintf(&b, "- **Image:** `%s`\n", run.Image)
 	fmt.Fprintf(&b, "- **Started:** %s\n", run.StartedAt.Local().Format("2006-01-02 15:04"))
 	fmt.Fprintf(&b, "- **Trials:** %d (%d at a time), base seed `%d`\n", agg.Trials, run.Workers, run.BaseSeed)
-	fmt.Fprintf(&b, "- **CPU limits:** %s\n", formatLevels(run.CPULevels))
+	fmt.Fprintf(&b, "- **CPU limits:** %s\n", FormatLevels(run.CPULevels))
 	if run.Service != "" {
-		fmt.Fprintf(&b, "- **Network latency:** %s (service `%s`)\n", formatLatencies(run.LatencyLevels), run.Service)
+		fmt.Fprintf(&b, "- **Network latency:** %s (service `%s`)\n", FormatLatencies(run.LatencyLevels), run.Service)
 	}
 	if agg.InfraFails > 0 || agg.Timeouts > 0 {
 		fmt.Fprintf(&b, "- **Excluded:** %d trials with infrastructure errors, %d timed out\n", agg.InfraFails, agg.Timeouts)
@@ -180,7 +184,7 @@ func WriteMarkdown(w io.Writer, run RunInfo, agg *Aggregate, causes []Cause) err
 	b.WriteString("## Summary\n\n")
 	b.WriteString("| Test | Failed | 95% CI | Likely cause |\n|---|---|---|---|\n")
 	for _, s := range flaky {
-		low, high := Wilson(s.Failures, s.Runs)
+		low, high := analysis.Wilson(s.Failures, s.Runs)
 		label := "unknown"
 		if c := byName[s.Name]; c != nil {
 			label = c.Label
@@ -192,7 +196,7 @@ func WriteMarkdown(w io.Writer, run RunInfo, agg *Aggregate, causes []Cause) err
 
 	for _, s := range flaky {
 		c := byName[s.Name]
-		low, high := Wilson(s.Failures, s.Runs)
+		low, high := analysis.Wilson(s.Failures, s.Runs)
 		fmt.Fprintf(&b, "## `%s`\n\n", s.Name)
 		if c != nil {
 			fmt.Fprintf(&b, "**Likely cause: %s.** %s.\n\n", c.Label, capitalize(c.Detail))
@@ -248,8 +252,8 @@ func WriteMarkdown(w io.Writer, run RunInfo, agg *Aggregate, causes []Cause) err
 	return err
 }
 
-// writeMarkdownFile fills in {id} in the path and writes the report there.
-func writeMarkdownFile(path string, run RunInfo, agg *Aggregate, causes []Cause) (string, error) {
+// WriteMarkdownFile fills in {id} in the path and writes the report there.
+func WriteMarkdownFile(path string, run store.RunInfo, agg *analysis.Aggregate, causes []analysis.Cause) (string, error) {
 	path = strings.ReplaceAll(path, "{id}", strconv.FormatInt(run.ID, 10))
 	if dir := filepath.Dir(path); dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -267,7 +271,7 @@ func writeMarkdownFile(path string, run RunInfo, agg *Aggregate, causes []Cause)
 	return path, f.Close()
 }
 
-func evidence(c Cause) []string {
+func evidence(c analysis.Cause) []string {
 	var ev []string
 	if c.CPUTested {
 		ev = append(ev, fmt.Sprintf("CPU trend p=%s (adjusted %s)", formatP(c.CPUp), formatP(c.CPUq)))
@@ -284,15 +288,7 @@ func evidence(c Cause) []string {
 	return ev
 }
 
-func causesByName(causes []Cause) map[string]*Cause {
-	m := map[string]*Cause{}
-	for i := range causes {
-		m[causes[i].Test] = &causes[i]
-	}
-	return m
-}
-
-func showLatency(flaky []*TestStats) bool {
+func showLatency(flaky []*analysis.TestStats) bool {
 	for _, s := range flaky {
 		if len(s.ByLatency) > 1 {
 			return true
@@ -308,7 +304,7 @@ func capitalize(s string) string {
 	return strings.ToUpper(s[:1]) + s[1:]
 }
 
-func formatCount(c Count) string {
+func formatCount(c analysis.Count) string {
 	return fmt.Sprintf("%d/%d (%.0f%%)", c.Failures, c.Runs, 100*c.Rate())
 }
 
@@ -330,10 +326,10 @@ func formatLatency(ms int) string {
 	if ms == 0 {
 		return "none"
 	}
-	return fmt.Sprintf("%d+/-%dms", ms, Jitter(ms))
+	return fmt.Sprintf("%d+/-%dms", ms, runner.Jitter(ms))
 }
 
-func formatLatencies(ls []int) string {
+func FormatLatencies(ls []int) string {
 	if len(ls) == 0 {
 		return "-"
 	}
@@ -344,7 +340,7 @@ func formatLatencies(ls []int) string {
 	return strings.Join(parts, ", ")
 }
 
-func formatLevels(ls []float64) string {
+func FormatLevels(ls []float64) string {
 	if len(ls) == 0 {
 		return "-"
 	}

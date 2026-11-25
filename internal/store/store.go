@@ -1,8 +1,10 @@
-package main
+package store
 
 import (
 	"database/sql"
 	"fmt"
+	"github.com/daphnezlin/flakehunt/internal/analysis"
+	"github.com/daphnezlin/flakehunt/internal/runner"
 	"strconv"
 	"strings"
 	"time"
@@ -201,7 +203,7 @@ func (s *Store) FinishRun(runID int64) error {
 
 // SaveTrial writes a trial and all its test results in one transaction,
 // so a crash never leaves a trial half saved.
-func (s *Store) SaveTrial(runID int64, res TrialResult) error {
+func (s *Store) SaveTrial(runID int64, res runner.TrialResult) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -293,8 +295,8 @@ func (s *Store) GetRun(runID int64) (RunInfo, error) {
 
 // LoadAggregate rebuilds the TrialResults for a run and feeds them through
 // Aggregate.Add, so a saved report always matches what the live run printed.
-func (s *Store) LoadAggregate(runID int64) (*Aggregate, error) {
-	trials := map[int]*TrialResult{}
+func (s *Store) LoadAggregate(runID int64) (*analysis.Aggregate, error) {
+	trials := map[int]*runner.TrialResult{}
 	var order []int
 
 	rows, err := s.db.Query(`SELECT trial_id, seed, cpus, latency_ms, cpuset, status, error FROM trials WHERE run_id = ? AND replay_for = '' ORDER BY trial_id`, runID)
@@ -312,7 +314,7 @@ func (s *Store) LoadAggregate(runID int64) (*Aggregate, error) {
 			rows.Close()
 			return nil, err
 		}
-		tr := &TrialResult{Trial: Trial{ID: id, Seed: seed, CPUs: cpus, LatencyMS: latency}, CPUSet: cpuset}
+		tr := &runner.TrialResult{Trial: runner.Trial{ID: id, Seed: seed, CPUs: cpus, LatencyMS: latency}, CPUSet: cpuset}
 		switch status {
 		case "timeout":
 			tr.TimedOut = true
@@ -339,14 +341,14 @@ func (s *Store) LoadAggregate(runID int64) (*Aggregate, error) {
 			return nil, err
 		}
 		if tr := trials[id]; tr != nil { // nil for replay trials
-			tr.Tests = append(tr.Tests, TestOutcome{Name: test, Failed: outcome == "fail", Skip: outcome == "skip"})
+			tr.Tests = append(tr.Tests, runner.TestOutcome{Name: test, Failed: outcome == "fail", Skip: outcome == "skip"})
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	agg := NewAggregate()
+	agg := analysis.NewAggregate()
 	for _, id := range order {
 		agg.Add(*trials[id])
 	}
@@ -354,7 +356,7 @@ func (s *Store) LoadAggregate(runID int64) (*Aggregate, error) {
 }
 
 // LoadReplays counts how the target test did in each replay trial, keyed by test name.
-func (s *Store) LoadReplays(runID int64) (map[string]*Count, error) {
+func (s *Store) LoadReplays(runID int64) (map[string]*analysis.Count, error) {
 	rows, err := s.db.Query(`
 		SELECT t.replay_for, r.outcome
 		FROM trials t JOIN results r ON r.run_id = t.run_id AND r.trial_id = t.trial_id
@@ -364,7 +366,7 @@ func (s *Store) LoadReplays(runID int64) (map[string]*Count, error) {
 	}
 	defer rows.Close()
 
-	replays := map[string]*Count{}
+	replays := map[string]*analysis.Count{}
 	for rows.Next() {
 		var test, outcome string
 		if err := rows.Scan(&test, &outcome); err != nil {
@@ -375,7 +377,7 @@ func (s *Store) LoadReplays(runID int64) (map[string]*Count, error) {
 		}
 		c := replays[test]
 		if c == nil {
-			c = &Count{}
+			c = &analysis.Count{}
 			replays[test] = c
 		}
 		c.Runs++
@@ -386,7 +388,7 @@ func (s *Store) LoadReplays(runID int64) (map[string]*Count, error) {
 	return replays, rows.Err()
 }
 
-func (s *Store) SavePolluter(runID int64, test string, p PolluterResult) error {
+func (s *Store) SavePolluter(runID int64, test string, p analysis.PolluterResult) error {
 	_, err := s.db.Exec(`INSERT INTO polluters
 		(run_id, test, victim_node, fails_alone, polluter, polluter_node, note, probes)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -394,7 +396,7 @@ func (s *Store) SavePolluter(runID int64, test string, p PolluterResult) error {
 	return err
 }
 
-func (s *Store) LoadPolluters(runID int64) (map[string]PolluterResult, error) {
+func (s *Store) LoadPolluters(runID int64) (map[string]analysis.PolluterResult, error) {
 	rows, err := s.db.Query(`SELECT test, victim_node, fails_alone, polluter, polluter_node, note, probes
 		FROM polluters WHERE run_id = ?`, runID)
 	if err != nil {
@@ -402,10 +404,10 @@ func (s *Store) LoadPolluters(runID int64) (map[string]PolluterResult, error) {
 	}
 	defer rows.Close()
 
-	out := map[string]PolluterResult{}
+	out := map[string]analysis.PolluterResult{}
 	for rows.Next() {
 		var test string
-		var p PolluterResult
+		var p analysis.PolluterResult
 		if err := rows.Scan(&test, &p.VictimNode, &p.FailsAlone, &p.Polluter, &p.PolluterNode, &p.Note, &p.Probes); err != nil {
 			return nil, err
 		}

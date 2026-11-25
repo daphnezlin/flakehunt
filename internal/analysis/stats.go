@@ -1,16 +1,15 @@
-package main
+package analysis
 
 import "math"
 
-// Wilson returns the 95% Wilson score interval for a failure rate of
-// failures/n. Unlike the simple p ± 1.96·sqrt(p(1-p)/n) interval, it stays
-// sensible for small n and for rates near 0, which is exactly where flaky
-// tests live (e.g. 1 failure in 200 runs).
+// Wilson returns a 95% Wilson score interval for failures/n.
+// Using this instead of the normal approximation since it works better
+// for small n and rates near 0 (most flaky tests).
 func Wilson(failures, n int) (low, high float64) {
 	if n == 0 {
 		return 0, 1
 	}
-	const z = 1.959964 // 95% two-sided
+	const z = 1.959964
 	p := float64(failures) / float64(n)
 	nf := float64(n)
 	denom := 1 + z*z/nf

@@ -1,6 +1,7 @@
-package main
+package analysis
 
 import (
+	"github.com/daphnezlin/flakehunt/internal/runner"
 	"math"
 	"math/rand"
 	"strings"
@@ -80,7 +81,7 @@ func TestClassify(t *testing.T) {
 func TestAnalyzeZooShape(t *testing.T) {
 	agg := NewAggregate()
 	add := func(name string, cpus float64, failed bool) {
-		agg.Add(TrialResult{Trial: Trial{CPUs: cpus}, Tests: []TestOutcome{{Name: name, Failed: failed}}})
+		agg.Add(runner.TrialResult{Trial: runner.Trial{CPUs: cpus}, Tests: []runner.TestOutcome{{Name: name, Failed: failed}}})
 	}
 	for _, l := range []float64{0, 1, 0.5} {
 		race := map[float64]int{0: 2, 1: 8, 0.5: 16}[l]
@@ -124,7 +125,7 @@ func TestAnalyzeSeparatesCPUAndNetwork(t *testing.T) {
 	for _, cpu := range []float64{0, 1, 0.5} {
 		for _, lat := range []int{0, 50, 150} {
 			for i := 0; i < 10; i++ {
-				agg.Add(TrialResult{Trial: Trial{CPUs: cpu, LatencyMS: lat}, Tests: []TestOutcome{
+				agg.Add(runner.TrialResult{Trial: runner.Trial{CPUs: cpu, LatencyMS: lat}, Tests: []runner.TestOutcome{
 					{Name: "slow api", Failed: lat == 150 && i < 7},
 					{Name: "race", Failed: cpu == 0.5 && i < 6},
 				}})

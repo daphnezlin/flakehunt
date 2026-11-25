@@ -1,6 +1,9 @@
-package main
+package analysis
 
-import "fmt"
+import (
+	"fmt"
+	"github.com/daphnezlin/flakehunt/internal/runner"
+)
 
 // PolluterResult is what the polluter search found for one seed-dependent test.
 type PolluterResult struct {
@@ -25,14 +28,14 @@ type prober func(nodeIDs []string) (failed, ran bool, err error)
 //
 // Assumes one test is enough to pollute. If neither half fails on its own,
 // it needs several tests together and we stop and say so.
-func FindPolluter(victim TestOutcome, before []TestOutcome, probe prober) PolluterResult {
+func FindPolluter(victim runner.TestOutcome, before []runner.TestOutcome, probe prober) PolluterResult {
 	res := PolluterResult{VictimNode: victim.NodeID}
 	if victim.NodeID == "" {
 		res.Note = "no file path in results, can't rerun single tests"
 		return res
 	}
 
-	run := func(tests []TestOutcome) (bool, bool) {
+	run := func(tests []runner.TestOutcome) (bool, bool) {
 		ids := make([]string, 0, len(tests)+1)
 		for _, t := range tests {
 			ids = append(ids, t.NodeID)
@@ -59,7 +62,7 @@ func FindPolluter(victim TestOutcome, before []TestOutcome, probe prober) Pollut
 		return res
 	}
 
-	var cands []TestOutcome
+	var cands []runner.TestOutcome
 	for _, t := range before {
 		if t.NodeID != "" {
 			cands = append(cands, t)
