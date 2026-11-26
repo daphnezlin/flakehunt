@@ -84,8 +84,9 @@ Useful `run` flags:
 | `--cpu-levels` | `0,1,0.5` | CPU limits, 0 = no limit |
 | `--latency-levels` | `0,50,150` | network latency in ms (needs a service) |
 | `--focus-batch` | 36 | trials per focus batch, 0 turns focusing off |
-| `--focus-batches` | 3 | most focus batches before giving up on a test |
-| `--replays` | 5 | reruns of each flaky test's failing seed |
+| `--focus-batches` | 10 | most focus batches before giving up on a test |
+| `--replays` | 5 | reruns of each flaky test's failing seed, up to 3 rounds for tests that fail often anyway |
+| `--test-timeout` | 1m | per-test timeout, a test that hits it counts as a hang |
 | `--workers` | half your cores | trials at once |
 
 If the tests talk to a service (an api, a database), flakehunt can add network
@@ -112,12 +113,17 @@ latency in front of it:
 3. **Explain.** For each flaky test:
    - a one-sided permutation trend test checks if it fails more with less CPU or more latency,
      with Benjamini-Hochberg correction across every check
-   - its failing seed is rerun with no limits. Failing every time means the seed alone causes it
+   - tests that hit `--test-timeout` in at least half their failures are labelled hangs
+   - its failing seed is rerun with no limits. Failing every time means the seed alone causes it,
+     but only if that streak is unlikely given how often the test fails anyway. If it isn't yet,
+     the seed gets more reruns
    - for those, it's run alone. Failing alone means random data. Passing alone means another test
-     breaks it, and a binary search over the tests that ran before it finds which one
+     breaks it, and a binary search over the tests that ran before it finds which one. If rerunning
+     the exact failing order passes, the seed wasn't the cause after all
 4. **Focus.** Flaky tests whose cause is still unclear get extra trials running only those tests,
-   in batches. Each batch is followed by another check, and tests drop out as soon as their cause
-   is clear.
+   in batches, at the mildest and harshest CPU limit. Latency is only varied for tests with some
+   sign of a network effect. Each batch is followed by another check. Tests drop out as soon as
+   their cause is clear, or after 2 batches with no sign of a CPU or network effect at all.
 5. **Store.** Every trial is saved to SQLite, so any run can be re-reported or scored later.
 
 ## Layout
@@ -153,6 +159,20 @@ flaky-zoo/          tests with known causes, used as a benchmark
 - **Seed evidence beats a chance trend.** Conditions are assigned at random, independently of seeds.
   So if a test's failing seed fails every rerun with no limits, any CPU or latency trend for it can
   only be chance. Those tests are labelled from the polluter search, with the trend as a note.
+- **Replays are judged against the test's own failure rate.** A test that fails 90% of the time
+  fails 5 reruns in a row 59% of the time, seed or no seed. So a failing-every-time streak only
+  counts when its chance is under 5% (failure rate to the power of reruns), and tests that fail
+  often get more reruns until it's clear either way. This came from a zoo run where a slow
+  timing test was blamed on test order.
+- **CPU levels are scored by slowdown.** The trend test weights each CPU limit by how much it slows
+  a test down: 2 for 0.5, 1 for no limit or 1 CPU. Python test code holds the GIL, so extra
+  cores don't speed it up. Scoring the levels as even steps instead let noise between no limit
+  and 1 hide a real effect at 0.5.
+- **Focus trials at the extremes.** For a trend, the difference between the mildest and harshest
+  condition is what carries the evidence, so focus trials skip the middle levels. On a test going
+  from 19% to 33% failures at 0.5 CPU, this plus slowdown scoring and more batches took the chance
+  of labelling it timing from about 30% to about 80% in simulation. Tests with no sign of any
+  effect are dropped early, which can only make false timing or network labels rarer.
 - **Honest "stable".** Passing every one of n runs only rules out failure rates above roughly 3/n,
   so every report says what rate the run could have caught.
 - **Toxiproxy per trial, only when needed.** A shared proxy would let one trial's latency affect
@@ -190,8 +210,8 @@ go test -race ./...
 
 ## Status
 
-Done: detection, cause analysis, polluter search, network faults, adaptive sampling, markdown
-reports, scoring.
+Done: detection, cause analysis, hang detection, polluter search, network faults, adaptive
+sampling, markdown reports, scoring.
 
-Next: more zoo tests (time/date, hangs), running on real open source projects and scoring
+Next: running on real open source projects and scoring
 against [IDoFT](https://github.com/TestingResearchIllinois/idoft), CI, and releases.

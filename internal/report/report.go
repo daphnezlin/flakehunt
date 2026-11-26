@@ -73,6 +73,10 @@ func fixFor(label string) string {
 	case "random data":
 		return "Run the repro to see which value breaks it, then fix the code for that value and add a test for " +
 			"that edge case on purpose instead of relying on random data to hit it."
+	case "hang":
+		return "Find what the test waits on without a timeout: a lock, a thread join, a queue or a network call. " +
+			"Locks taken in a different order by different threads are a classic deadlock. Add timeouts to the waits " +
+			"so a failure says what it was stuck on."
 	case "seed + timing":
 		return "Start with the seed-dependent part (rerun with the seed to see what breaks), then check for a " +
 			"timeout or race that slow conditions make worse."
@@ -291,10 +295,18 @@ func evidence(c analysis.Cause) []string {
 		ev = append(ev, fmt.Sprintf("latency trend p=%s (adjusted %s)", formatP(c.NetP), formatP(c.NetQ)))
 	}
 	if c.Replays.Runs > 0 {
-		ev = append(ev, fmt.Sprintf("failing seed rerun %d/%d failed", c.Replays.Failures, c.Replays.Runs))
+		e := fmt.Sprintf("failing seed rerun %d/%d failed", c.Replays.Failures, c.Replays.Runs)
+		if c.Replays.Failures == c.Replays.Runs {
+			// how likely that streak is anyway, given how often the test fails
+			e += fmt.Sprintf(" (%.0f%% chance at its %.0f%% failure rate)", 100*c.SeedP(), 100*c.BaseRate)
+		}
+		ev = append(ev, e)
 	}
 	if c.Polluter != nil {
 		ev = append(ev, fmt.Sprintf("polluter search used %d runs", c.Polluter.Probes))
+	}
+	if c.Hangs > 0 {
+		ev = append(ev, fmt.Sprintf("hit the per-test timeout in %d of %d failures", c.Hangs, c.Failures))
 	}
 	return ev
 }

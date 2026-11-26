@@ -3,17 +3,28 @@ package runner
 import (
 	"strconv"
 	"strings"
+	"time"
 )
 
 // PytestArgs builds the pytest command for a trial. Shared by every runner so
 // docker and (later) k8s run tests exactly the same way.
-func PytestArgs(t Trial, junitPath string) []string {
+//
+// testTimeout > 0 sets a per-test timeout through pytest-timeout, so one hung
+// test fails on its own instead of stalling the whole trial. It's passed as ini
+// options (-o), which pytest only warns about if the plugin isn't installed, so
+// projects without it still run. The signal method fails just the test; the
+// thread method would kill the whole pytest process.
+func PytestArgs(t Trial, junitPath string, testTimeout time.Duration) []string {
 	args := []string{
 		"pytest", "-q", "-p", "no:cacheprovider",
 		"--randomly-seed=" + strconv.FormatInt(t.Seed, 10),
 		// xunit1 adds the file path to each test, needed to build node ids
 		"-o", "junit_family=xunit1",
 		"--junitxml=" + junitPath,
+	}
+	if testTimeout > 0 {
+		args = append(args, "-o", "timeout="+strconv.FormatFloat(testTimeout.Seconds(), 'f', -1, 64),
+			"-o", "timeout_method=signal")
 	}
 	if len(t.Tests) > 0 {
 		// run exactly these tests in exactly this order. the seed still

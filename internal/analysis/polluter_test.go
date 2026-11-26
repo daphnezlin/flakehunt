@@ -66,7 +66,7 @@ func TestFindPolluterNeedsTwo(t *testing.T) {
 func TestFindPolluterCantReproduce(t *testing.T) {
 	neverFails := func(ids []string) (bool, bool, error) { return false, true, nil }
 	res := FindPolluter(outcomes("victim")[0], outcomes("a", "b"), neverFails)
-	if res.FailsAlone || res.Polluter != "" || !strings.Contains(res.Note, "couldn't reproduce") {
+	if res.FailsAlone || res.Polluter != "" || !res.Unreproduced || !strings.Contains(res.Note, "couldn't reproduce") {
 		t.Errorf("got %+v", res)
 	}
 }

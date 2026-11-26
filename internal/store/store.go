@@ -80,6 +80,10 @@ var migrations = []string{
 	`
 	ALTER TABLE runs ADD COLUMN alpha REAL NOT NULL DEFAULT 0.05;
 	`,
+	// 7: polluter search couldn't reproduce the failure in its original order
+	`
+	ALTER TABLE polluters ADD COLUMN unreproduced INTEGER NOT NULL DEFAULT 0;
+	`,
 }
 
 type Store struct {
@@ -238,9 +242,12 @@ func (s *Store) SaveTrial(runID int64, res runner.TrialResult) error {
 	defer stmt.Close()
 	for _, t := range res.Tests {
 		outcome := "pass"
-		if t.Skip {
+		switch {
+		case t.Skip:
 			outcome = "skip"
-		} else if t.Failed {
+		case t.Hung:
+			outcome = "timeout"
+		case t.Failed:
 			outcome = "fail"
 		}
 		if _, err := stmt.Exec(runID, res.Trial.ID, t.Name, outcome); err != nil {
@@ -346,7 +353,8 @@ func (s *Store) LoadAggregate(runID int64) (*analysis.Aggregate, error) {
 			return nil, err
 		}
 		if tr := trials[id]; tr != nil { // nil for replay trials
-			tr.Tests = append(tr.Tests, runner.TestOutcome{Name: test, Failed: outcome == "fail", Skip: outcome == "skip"})
+			tr.Tests = append(tr.Tests, runner.TestOutcome{Name: test, Failed: outcome == "fail" || outcome == "timeout",
+				Hung: outcome == "timeout", Skip: outcome == "skip"})
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -386,7 +394,7 @@ func (s *Store) LoadReplays(runID int64) (map[string]*analysis.Count, error) {
 			replays[test] = c
 		}
 		c.Runs++
-		if outcome == "fail" {
+		if outcome == "fail" || outcome == "timeout" {
 			c.Failures++
 		}
 	}
@@ -395,14 +403,14 @@ func (s *Store) LoadReplays(runID int64) (map[string]*analysis.Count, error) {
 
 func (s *Store) SavePolluter(runID int64, test string, p analysis.PolluterResult) error {
 	_, err := s.db.Exec(`INSERT INTO polluters
-		(run_id, test, victim_node, fails_alone, polluter, polluter_node, note, probes)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		runID, test, p.VictimNode, p.FailsAlone, p.Polluter, p.PolluterNode, p.Note, p.Probes)
+		(run_id, test, victim_node, fails_alone, polluter, polluter_node, note, probes, unreproduced)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		runID, test, p.VictimNode, p.FailsAlone, p.Polluter, p.PolluterNode, p.Note, p.Probes, p.Unreproduced)
 	return err
 }
 
 func (s *Store) LoadPolluters(runID int64) (map[string]analysis.PolluterResult, error) {
-	rows, err := s.db.Query(`SELECT test, victim_node, fails_alone, polluter, polluter_node, note, probes
+	rows, err := s.db.Query(`SELECT test, victim_node, fails_alone, polluter, polluter_node, note, probes, unreproduced
 		FROM polluters WHERE run_id = ?`, runID)
 	if err != nil {
 		return nil, err
@@ -413,7 +421,7 @@ func (s *Store) LoadPolluters(runID int64) (map[string]analysis.PolluterResult, 
 	for rows.Next() {
 		var test string
 		var p analysis.PolluterResult
-		if err := rows.Scan(&test, &p.VictimNode, &p.FailsAlone, &p.Polluter, &p.PolluterNode, &p.Note, &p.Probes); err != nil {
+		if err := rows.Scan(&test, &p.VictimNode, &p.FailsAlone, &p.Polluter, &p.PolluterNode, &p.Note, &p.Probes, &p.Unreproduced); err != nil {
 			return nil, err
 		}
 		out[test] = p

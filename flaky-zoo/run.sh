@@ -1,10 +1,11 @@
 #!/bin/sh
 # Runs flakehunt on the zoo, with a service for the network test.
-# Run from the repo root: ./flaky-zoo/run.sh --runs 135
+# Run from the repo root: ./flaky-zoo/run.sh (extra flags go to flakehunt run)
 # RACE_WAIT overrides the race test's wait (default 0.045).
 
 ./flakehunt run --image flaky-zoo \
   --env FLAKY_ZOO_RACE_WAIT=${RACE_WAIT:-0.045} \
+  --test-timeout 2s \
   --service-image flaky-zoo \
   --service-cmd "python -m http.server 8000" \
   --service-port 8000 \

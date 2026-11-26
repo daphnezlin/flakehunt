@@ -29,6 +29,7 @@ type TestStats struct {
 	StrataCPU     map[string]map[float64]*Count
 	StrataLatency map[string]map[float64]*Count
 	Failing       []runner.Trial // trials where it failed, for repro commands
+	Hangs         int            // failures that were the per-test timeout
 
 	// every test's result from the first failing trial, in the order they ran.
 	// the polluter search needs to know what ran before it
@@ -82,6 +83,9 @@ func (a *Aggregate) Add(res runner.TrialResult) {
 			}
 		}
 		if o.Failed {
+			if o.Hung {
+				s.Hangs++
+			}
 			s.Failing = append(s.Failing, res.Trial)
 			if s.FirstFailure == nil {
 				s.FirstFailure = res.Tests
@@ -158,4 +162,18 @@ func (a *Aggregate) StableRuns() int {
 		}
 	}
 	return min
+}
+
+// FullSuiteRate is how often the test failed in full-suite trials. Focused
+// trials run it alone, which can change its rate, so they're left out.
+func (s TestStats) FullSuiteRate() float64 {
+	var c Count
+	for _, n := range s.StrataCPU[""] {
+		c.Runs += n.Runs
+		c.Failures += n.Failures
+	}
+	if c.Runs == 0 {
+		return s.Rate()
+	}
+	return c.Rate()
 }
