@@ -114,7 +114,7 @@ func TestReproForLatency(t *testing.T) {
 }
 
 func TestFixForEveryLabel(t *testing.T) {
-	for _, l := range []string{"timing", "network", "timing + network", "order-dependent", "random data", "seed + timing"} {
+	for _, l := range []string{"timing", "network", "timing + network", "order-dependent", "random data", "seed + timing", "hang"} {
 		if fixFor(l) == fixFor("unknown") {
 			t.Errorf("no specific fix for %q", l)
 		}

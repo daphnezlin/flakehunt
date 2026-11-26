@@ -51,6 +51,7 @@ func runCmd() *cobra.Command {
 		catchRate float64
 		markdown  string
 		timeout   time.Duration
+		testTO    time.Duration
 		env       []string
 		outDir    string
 		baseSeed  int64
@@ -87,7 +88,7 @@ func runCmd() *cobra.Command {
 				latencies = nil
 			}
 
-			dr, err := runner.NewDockerRunner(ctx, image, outDir, env, workers, timeout, service, toxiImage)
+			dr, err := runner.NewDockerRunner(ctx, image, outDir, env, workers, timeout, testTO, service, toxiImage)
 			if err != nil {
 				return err
 			}
@@ -164,9 +165,10 @@ func runCmd() *cobra.Command {
 	f.IntVar(&replays, "replays", 5, "reruns of each flaky test's failing seed, to check if the seed alone causes it (0 = off)")
 	f.BoolVar(&polluters, "find-polluters", true, "for seed-dependent tests, check if they fail alone and find which earlier test breaks them")
 	f.IntVar(&focusN, "focus-batch", 36, "trials per focus batch: extra trials of only the tests whose cause is unclear (0 = off)")
-	f.IntVar(&focusMax, "focus-batches", 3, "most focus batches to run before giving up on a test")
+	f.IntVar(&focusMax, "focus-batches", 10, "most focus batches to run before giving up on a test")
 	f.StringVar(&markdown, "markdown", defaultMarkdownPath, "where to write a markdown report, {id} is the run id (\"\" = don't write one)")
-	f.DurationVar(&timeout, "timeout", 5*time.Minute, "per-trial timeout; longer runs count as hangs")
+	f.DurationVar(&timeout, "timeout", 5*time.Minute, "per-trial timeout, a safety net for the whole suite")
+	f.DurationVar(&testTO, "test-timeout", time.Minute, "per-test timeout through pytest-timeout, so a hung test fails on its own (0 = off)")
 	f.StringArrayVar(&env, "env", nil, "env var for every trial, KEY=VALUE (repeatable)")
 	f.StringVar(&outDir, "out", "flakehunt-out", "folder for per-trial results")
 	f.Int64Var(&baseSeed, "seed", time.Now().UnixNano(), "base seed for the campaign")

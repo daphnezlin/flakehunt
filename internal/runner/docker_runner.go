@@ -14,18 +14,19 @@ import (
 
 // DockerRunner runs each trial in a fresh container.
 type DockerRunner struct {
-	cli     *client.Client
-	image   string
-	outDir  string   // abs path, one subfolder per trial mounted at /results
-	env     []string // passed to every trial
-	timeout time.Duration
-	slots   chan string // free cpusets, nil if pinning is off
+	cli         *client.Client
+	image       string
+	outDir      string        // abs path, one subfolder per trial mounted at /results
+	env         []string      // passed to every trial
+	timeout     time.Duration // whole trial
+	testTimeout time.Duration // each test, 0 = none
+	slots       chan string   // free cpusets, nil if pinning is off
 
 	service        *ServiceConfig // nil = no service, no network faults
 	toxiproxyImage string
 }
 
-func NewDockerRunner(ctx context.Context, image, outDir string, env []string, workers int, timeout time.Duration,
+func NewDockerRunner(ctx context.Context, image, outDir string, env []string, workers int, timeout, testTimeout time.Duration,
 	service *ServiceConfig, toxiproxyImage string) (*DockerRunner, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -35,7 +36,7 @@ func NewDockerRunner(ctx context.Context, image, outDir string, env []string, wo
 	if err != nil {
 		return nil, err
 	}
-	d := &DockerRunner{cli: cli, image: image, outDir: abs, env: env, timeout: timeout,
+	d := &DockerRunner{cli: cli, image: image, outDir: abs, env: env, timeout: timeout, testTimeout: testTimeout,
 		service: service, toxiproxyImage: toxiproxyImage}
 
 	if service != nil {
@@ -85,7 +86,7 @@ func (d *DockerRunner) Run(ctx context.Context, t Trial) TrialResult {
 	// container might not run as us
 	_ = os.Chmod(trialDir, 0o777)
 
-	cmd := PytestArgs(t, "/results/junit.xml")
+	cmd := PytestArgs(t, "/results/junit.xml", d.testTimeout)
 	env := d.env
 
 	hostCfg := &container.HostConfig{Binds: []string{trialDir + ":/results"}}

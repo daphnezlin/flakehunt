@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-RUN pip install --no-cache-dir pytest==8.* pytest-randomly==3.*
+RUN pip install --no-cache-dir pytest==8.* pytest-randomly==3.* pytest-timeout==2.*
 
 WORKDIR /app
 COPY tests/ tests/

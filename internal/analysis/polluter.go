@@ -12,6 +12,7 @@ type PolluterResult struct {
 	PolluterNode string
 	VictimNode   string
 	Note         string // why the search stopped early, if it did
+	Unreproduced bool   // passed when rerun in the exact failing order
 	Probes       int    // pytest runs used
 }
 
@@ -79,6 +80,7 @@ func FindPolluter(victim runner.TestOutcome, before []runner.TestOutcome, probe 
 	}
 	if !failed {
 		res.Note = "passed when rerun in the same order, couldn't reproduce"
+		res.Unreproduced = true
 		return res
 	}
 

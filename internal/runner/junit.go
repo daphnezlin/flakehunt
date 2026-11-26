@@ -4,22 +4,34 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"strings"
 )
 
 type TestOutcome struct {
 	Name   string // classname::name
 	NodeID string // pytest node id, "" if the xml has no file path
 	Failed bool   // failure or error
+	Hung   bool   // failed because it hit the per-test timeout
 	Skip   bool
 }
 
+// junitProblem is a <failure> or <error> element. pytest-timeout's message
+// looks like "Failed: Timeout (>2.0s) from pytest-timeout."
+type junitProblem struct {
+	Message string `xml:"message,attr"`
+}
+
+func (p *junitProblem) hung() bool {
+	return p != nil && strings.Contains(p.Message, "Timeout") && strings.Contains(p.Message, "pytest-timeout")
+}
+
 type junitCase struct {
-	ClassName string    `xml:"classname,attr"`
-	Name      string    `xml:"name,attr"`
-	File      string    `xml:"file,attr"`
-	Failure   *struct{} `xml:"failure"`
-	Error     *struct{} `xml:"error"`
-	Skipped   *struct{} `xml:"skipped"`
+	ClassName string        `xml:"classname,attr"`
+	Name      string        `xml:"name,attr"`
+	File      string        `xml:"file,attr"`
+	Failure   *junitProblem `xml:"failure"`
+	Error     *junitProblem `xml:"error"`
+	Skipped   *struct{}     `xml:"skipped"`
 }
 
 type junitSuite struct {
@@ -41,6 +53,7 @@ func ParseJUnit(r io.Reader) ([]TestOutcome, error) {
 				Name:   c.ClassName + "::" + c.Name,
 				NodeID: NodeID(c.File, c.ClassName, c.Name),
 				Failed: c.Failure != nil || c.Error != nil,
+				Hung:   c.Failure.hung() || c.Error.hung(),
 				Skip:   c.Skipped != nil,
 			})
 		}

@@ -28,15 +28,17 @@ type Cause struct {
 	NetQ      float64
 	Replays   Count // reruns of a failing seed with no cpu limit
 	Polluter  *PolluterResult
+	Hangs     int // failures that hit the per-test timeout
+	Failures  int
+	BaseRate  float64 // how often it fails in full-suite trials, whatever the seed
 	Alpha     float64 // threshold the q-values were compared against
 	Label     string
 	Detail    string
 }
 
 // TrendPValue checks if failures go up as conditions get worse (less cpu, more
-// latency), using a permutation test. levels must be ordered best to worst.
-// The statistic is the sum of "how bad" rank over failing runs (0 for the best
-// level, 1 for the next, ...). If the condition doesn't matter, which runs
+// latency), using a permutation test. scores[i] says how bad levels[i] is, and
+// the statistic is the sum of scores over failing runs. If the condition doesn't matter, which runs
 // failed is basically random, so we shuffle the failures across runs many times
 // and see how often a shuffle looks at least as bad as what we observed.
 //
@@ -50,17 +52,18 @@ type Cause struct {
 // Permutation instead of a chi-square/normal approximation since counts per
 // level are small (10-20 runs). One sided since worse conditions making a test
 // pass more often isn't something we're looking for.
-func TrendPValue(levels []float64, strata []map[float64]*Count, rng *rand.Rand) float64 {
-	if len(levels) < 2 {
+func TrendPValue(levels, scores []float64, strata []map[float64]*Count, rng *rand.Rand) float64 {
+	if distinct(scores) < 2 {
+		// every level is equally bad, nothing to compare
 		return math.NaN()
 	}
 	type group struct {
-		ranks []int
+		ranks []float64
 		idx   []int
 		f     int
 	}
 	var groups []group
-	observed, fixed := 0, 0 // fixed: part of the statistic shuffling can't change
+	observed, fixed := 0.0, 0.0 // fixed: part of the statistic shuffling can't change
 	for _, by := range strata {
 		var g group
 		for i, l := range levels {
@@ -69,9 +72,9 @@ func TrendPValue(levels []float64, strata []map[float64]*Count, rng *rand.Rand) 
 				continue
 			}
 			for j := 0; j < c.Runs; j++ {
-				g.ranks = append(g.ranks, i)
+				g.ranks = append(g.ranks, scores[i])
 			}
-			observed += i * c.Failures
+			observed += scores[i] * float64(c.Failures)
 			g.f += c.Failures
 		}
 		n := len(g.ranks)
@@ -107,7 +110,7 @@ func TrendPValue(levels []float64, strata []map[float64]*Count, rng *rand.Rand) 
 				t += g.ranks[g.idx[k]]
 			}
 		}
-		if t >= observed {
+		if t >= observed-1e-9 {
 			atLeast++
 		}
 	}
@@ -160,14 +163,14 @@ func AnalyzeAt(agg *Aggregate, replays map[string]*Count, polluters map[string]P
 		if !s.Flaky() {
 			continue
 		}
-		c := Cause{Test: s.Name, Alpha: alpha}
+		c := Cause{Test: s.Name, Alpha: alpha, Hangs: s.Hangs, Failures: s.Failures, BaseRate: s.FullSuiteRate()}
 		i := len(causes)
-		if p := TrendPValue(s.CPULevels(), strata(s.StrataCPU), rng); !math.IsNaN(p) {
+		if p := TrendPValue(s.CPULevels(), CPUScores(s.CPULevels()), strata(s.StrataCPU), rng); !math.IsNaN(p) {
 			c.CPUTested, c.CPUp = true, p
 			ps = append(ps, p)
 			setQ = append(setQ, func(q float64) { causes[i].CPUq = q })
 		}
-		if p := TrendPValue(s.LatencyLevels(), strata(s.StrataLatency), rng); !math.IsNaN(p) {
+		if p := TrendPValue(s.LatencyLevels(), Ranks(len(s.LatencyLevels())), strata(s.StrataLatency), rng); !math.IsNaN(p) {
 			c.NetTested, c.NetP = true, p
 			ps = append(ps, p)
 			setQ = append(setQ, func(q float64) { causes[i].NetQ = q })
@@ -195,6 +198,19 @@ func classify(c Cause) (label, detail string) {
 	net := c.NetworkSensitive()
 	replayed := c.Replays.Runs > 0
 	seed := c.SeedDetermined()
+	// the polluter search reruns the exact failing order. if that passed, the
+	// seed can't be what makes it fail, whatever the replays looked like
+	unreproduced := seed && c.Polluter != nil && c.Polluter.Unreproduced
+	if unreproduced {
+		seed = false
+	}
+	label, detail = classifyOther(c, cpu, net, replayed)
+	if unreproduced {
+		detail += " (its failing seed failed every replay, but rerunning that exact order passed, so the seed isn't the cause)"
+	}
+	if !seed {
+		return label, detail
+	}
 
 	switch {
 	case seed && c.Polluter != nil:
@@ -212,6 +228,22 @@ func classify(c Cause) (label, detail string) {
 		return "seed + timing", "fails every time with this seed, and also fails more with less cpu or a slower network"
 	case seed:
 		return "seed-dependent", "fails every time with the same seed, so it depends on test order or random data, not timing"
+	}
+	return label, detail
+}
+
+// classifyOther handles tests whose failures the seed doesn't explain.
+func classifyOther(c Cause, cpu, net, replayed bool) (label, detail string) {
+	switch {
+	case c.Hung():
+		// checked before cpu and network: a hang is a stronger, more specific
+		// signal, and slow conditions can make a deadlock more or less likely
+		detail := fmt.Sprintf("never finished in %d of its %d failures (hit the per-test timeout), likely a deadlock "+
+			"or waiting on something that doesn't come", c.Hangs, c.Failures)
+		if cpu || net {
+			detail += fmt.Sprintf(", and happened more with %s", trendName(cpu, net))
+		}
+		return "hang", detail
 	case cpu && net:
 		return "timing + network", "fails more with less cpu and with a slower network, likely a timeout that's too tight"
 	case net:
@@ -239,10 +271,21 @@ func classifySeed(p PolluterResult) (label, detail string) {
 	}
 }
 
+// Hung is true when most of a test's failures were the per-test timeout.
+func (c Cause) Hung() bool { return c.Hangs > 0 && 2*c.Hangs >= c.Failures }
+
+// SeedP is the chance of the replays all failing if the seed had nothing to do
+// with it: a test that fails at BaseRate anyway fails n replays in a row with
+// probability BaseRate^n. A test that fails 90% of the time fails 5 replays in
+// a row 59% of the time, so "failed every replay" alone proves nothing for it.
+func (c Cause) SeedP() float64 {
+	return math.Pow(c.BaseRate, float64(c.Replays.Runs))
+}
+
 // SeedDetermined is true when rerunning the failing seed failed every time,
 // i.e. test order or random data alone is enough to make it fail.
 func (c Cause) SeedDetermined() bool {
-	return c.Replays.Runs > 0 && c.Replays.Failures == c.Replays.Runs
+	return c.Replays.Runs > 0 && c.Replays.Failures == c.Replays.Runs && c.SeedP() < DefaultAlpha
 }
 
 func trendName(cpu, net bool) string {
@@ -308,4 +351,48 @@ func CausesByName(causes []Cause) map[string]*Cause {
 		m[causes[i].Test] = &causes[i]
 	}
 	return m
+}
+
+// Slowdown is how much slower a cpu limit makes a test compared to one full
+// core: 2 for 0.5, 4 for 0.25. Limits of 1 or more, and no limit (0), are all
+// 1. Python test code holds the GIL, so it can't run on more than one core at
+// a time, and extra cores don't make it any faster. Below one core it gets
+// throttled, so it takes 1/cpus as long.
+//
+// Scoring cpu levels this way instead of as evenly spaced steps matches how
+// timing bugs behave: a test that fails when its work takes too long fails
+// about twice as often at 0.5, and about the same with no limit or 1.
+func Slowdown(cpus float64) float64 {
+	if cpus <= 0 || cpus >= 1 {
+		return 1
+	}
+	return 1 / cpus
+}
+
+// CPUScores scores cpu levels by Slowdown.
+func CPUScores(levels []float64) []float64 {
+	scores := make([]float64, len(levels))
+	for i, l := range levels {
+		scores[i] = Slowdown(l)
+	}
+	return scores
+}
+
+// Ranks scores n levels as evenly spaced steps 0, 1, 2, ... Latency uses this:
+// there's no general rule for how latency turns into failures, a timeout can
+// fail at 150ms and never at 50ms.
+func Ranks(n int) []float64 {
+	r := make([]float64, n)
+	for i := range r {
+		r[i] = float64(i)
+	}
+	return r
+}
+
+func distinct(xs []float64) int {
+	seen := map[float64]bool{}
+	for _, x := range xs {
+		seen[x] = true
+	}
+	return len(seen)
 }

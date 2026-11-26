@@ -158,13 +158,38 @@ func TestNodeID(t *testing.T) {
 }
 
 func TestPytestArgs(t *testing.T) {
-	whole := strings.Join(PytestArgs(Trial{Seed: 7}, "/r/j.xml"), " ")
+	whole := strings.Join(PytestArgs(Trial{Seed: 7}, "/r/j.xml", 0), " ")
 	if !strings.Contains(whole, "--randomly-seed=7") || strings.Contains(whole, "dont-reorganize") {
 		t.Errorf("whole suite args: %s", whole)
 	}
-	picked := PytestArgs(Trial{Seed: 7, Tests: []string{"a.py::x", "a.py::y"}}, "/r/j.xml")
+	picked := PytestArgs(Trial{Seed: 7, Tests: []string{"a.py::x", "a.py::y"}}, "/r/j.xml", 0)
 	n := len(picked)
 	if picked[n-3] != "--randomly-dont-reorganize" || picked[n-2] != "a.py::x" || picked[n-1] != "a.py::y" {
 		t.Errorf("picked args: %v", picked)
+	}
+}
+
+func TestPytestArgsTimeout(t *testing.T) {
+	args := strings.Join(PytestArgs(Trial{Seed: 7}, "/r/j.xml", 2*time.Second), " ")
+	if !strings.Contains(args, "-o timeout=2 -o timeout_method=signal") {
+		t.Errorf("got %s", args)
+	}
+}
+
+func TestParseJUnitHang(t *testing.T) {
+	xml := `<testsuites><testsuite>
+  <testcase classname="tests.test_deadlock" name="test_transfer" file="tests/test_deadlock.py">
+    <failure message="Failed: Timeout (&gt;2.0s) from pytest-timeout.">+++ Timeout +++</failure></testcase>
+  <testcase classname="tests.test_x" name="test_y" file="tests/test_x.py"><failure message="assert 1 == 2"/></testcase>
+</testsuite></testsuites>`
+	got, err := ParseJUnit(strings.NewReader(xml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got[0].Failed || !got[0].Hung {
+		t.Errorf("timeout should be a hung failure: %+v", got[0])
+	}
+	if !got[1].Failed || got[1].Hung {
+		t.Errorf("plain failure isn't a hang: %+v", got[1])
 	}
 }

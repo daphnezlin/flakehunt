@@ -24,15 +24,19 @@ import (
 type fakeSuite struct {
 	raceRate  map[float64]float64
 	aloneBump float64 // extra failure rate for race when it runs on its own
+	hot       bool    // add a test that fails 90% of the time for no particular reason
+	noisy     bool    // add a test that fails 30% of the time for no particular reason
 
 	mu             sync.Mutex
 	focused        [][]string // Tests of every focus trial
 	focusLatencies []int
+	focusCPUs      []float64
 }
 
 var nodes = map[string]string{
 	"t.py::polluter": "m::polluter", "t.py::order": "m::order", "t.py::race": "m::race",
-	"t.py::api": "m::api", "t.py::ok": "m::ok",
+	"t.py::api": "m::api", "t.py::ok": "m::ok", "t.py::hot": "m::hot",
+	"t.py::noisy": "m::noisy",
 }
 
 func (f *fakeSuite) Run(ctx context.Context, t runner.Trial) runner.TrialResult {
@@ -42,11 +46,18 @@ func (f *fakeSuite) Run(ctx context.Context, t runner.Trial) runner.TrialResult 
 		if t.Seed%2 == 0 {
 			order[0], order[1] = order[1], order[0]
 		}
+		if f.hot {
+			order = append(order, "t.py::hot")
+		}
+		if f.noisy {
+			order = append(order, "t.py::noisy")
+		}
 	}
 	if t.Probe == "focus" {
 		f.mu.Lock()
 		f.focused = append(f.focused, t.Tests)
 		f.focusLatencies = append(f.focusLatencies, t.LatencyMS)
+		f.focusCPUs = append(f.focusCPUs, t.CPUs)
 		f.mu.Unlock()
 	}
 
@@ -66,6 +77,11 @@ func (f *fakeSuite) Run(ctx context.Context, t runner.Trial) runner.TrialResult 
 				rate += f.aloneBump
 			}
 			failed = rng.Float64() < rate
+		case "t.py::hot":
+			// its own rng so adding it doesn't change the other tests' results
+			failed = rand.New(rand.NewSource(int64(t.ID)*31+7)).Float64() < 0.9
+		case "t.py::noisy":
+			failed = rand.New(rand.NewSource(int64(t.ID)*131+3)).Float64() < 0.3
 		case "t.py::api":
 			failed = t.LatencyMS == 150 && rng.Float64() < 0.9
 		}
@@ -223,5 +239,77 @@ func TestAlpha(t *testing.T) {
 	cfg.FocusBatch = 0
 	if got := cfg.Alpha(); got != analysis.DefaultAlpha {
 		t.Errorf("no focus should use the default, got %v", got)
+	}
+}
+
+func TestHighRateTestIsNotBlamedOnTheSeed(t *testing.T) {
+	suite := &fakeSuite{raceRate: map[float64]float64{0: 0.05, 1: 0.1, 0.5: 0.9}, hot: true}
+	cfg := baseConfig()
+	db, runID := newRun(t, cfg)
+	res, err := New(cfg, db, runID, suite).Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := labels(res)
+	hot := got["m::hot"]
+	if hot.Label == "order-dependent" || hot.Label == "random data" || hot.Label == "seed-dependent" {
+		t.Errorf("a test failing 90%% at random got blamed on the seed: %+v", hot)
+	}
+	// the order test still gets its real cause
+	if got["m::order"].Label != "order-dependent" {
+		t.Errorf("order: %+v", got["m::order"])
+	}
+}
+
+func TestFocusUsesTheMildestAndHarshestCPU(t *testing.T) {
+	suite := &fakeSuite{raceRate: map[float64]float64{0: 0.1, 1: 0.1, 0.5: 0.3}}
+	cfg := baseConfig()
+	db, runID := newRun(t, cfg)
+	if _, err := New(cfg, db, runID, suite).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(suite.focusCPUs) == 0 {
+		t.Fatal("expected focus trials for the weak race effect")
+	}
+	seen := map[float64]int{}
+	for _, c := range suite.focusCPUs {
+		seen[c]++
+	}
+	// no limit and 1 are the same speed, so the mild end is no limit (first in config)
+	if len(seen) != 2 || seen[0] == 0 || seen[0.5] == 0 || seen[0] != seen[0.5] {
+		t.Errorf("focus cpu levels: %v", seen)
+	}
+}
+
+func TestFocusDropsTestsWithNoEffect(t *testing.T) {
+	// race is clear after detection, noisy fails 30% no matter what
+	suite := &fakeSuite{raceRate: map[float64]float64{0: 0.05, 1: 0.05, 0.5: 0.9}, noisy: true}
+	cfg := baseConfig()
+	cfg.FocusLooks = 10
+	db, runID := newRun(t, cfg)
+	res, err := New(cfg, db, runID, suite).Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := labels(res)["m::noisy"].Label; got != "nondeterministic" {
+		t.Errorf("noisy: %q", got)
+	}
+	if res.Stats.FocusBatches >= cfg.FocusLooks {
+		t.Errorf("a test with no cpu or network effect used the whole budget (%d batches)", res.Stats.FocusBatches)
+	}
+	if res.Stats.FocusBatches < minFocusBatches {
+		t.Errorf("dropped before getting %d batches: %d", minFocusBatches, res.Stats.FocusBatches)
+	}
+}
+
+func TestExtremes(t *testing.T) {
+	if got := cpuExtremes([]float64{0, 1, 0.5, 0.25}); len(got) != 2 || got[0] != 0 || got[1] != 0.25 {
+		t.Errorf("cpu: %v", got)
+	}
+	if got := cpuExtremes([]float64{0, 2}); len(got) != 2 {
+		t.Errorf("all equally fast should keep every level: %v", got)
+	}
+	if got := latencyExtremes([]int{0, 50, 150}); len(got) != 2 || got[0] != 0 || got[1] != 150 {
+		t.Errorf("latency: %v", got)
 	}
 }

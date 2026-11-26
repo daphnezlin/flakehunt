@@ -135,7 +135,7 @@ func TestPolluterStorage(t *testing.T) {
 	store.SaveTrial(runID, runner.TrialResult{Trial: runner.Trial{ID: 1, ReplayFor: "v"}, Tests: []runner.TestOutcome{{Name: "v", Failed: true}}})
 	store.SaveTrial(runID, runner.TrialResult{Trial: runner.Trial{ID: 2, ReplayFor: "v", Probe: "polluter"}, Tests: []runner.TestOutcome{{Name: "v"}}})
 
-	want := analysis.PolluterResult{Polluter: "p", PolluterNode: "t.py::p", VictimNode: "t.py::v", Probes: 4}
+	want := analysis.PolluterResult{Polluter: "p", PolluterNode: "t.py::p", VictimNode: "t.py::v", Probes: 4, Unreproduced: true}
 	if err := store.SavePolluter(runID, "v", want); err != nil {
 		t.Fatal(err)
 	}
@@ -228,5 +228,25 @@ func TestStoreSavesLatency(t *testing.T) {
 	run, _ := store.GetRun(runID)
 	if !reflect.DeepEqual(run.LatencyLevels, []int{0, 150}) || run.Service != "api" {
 		t.Errorf("run: %+v", run)
+	}
+}
+
+func TestStoreKeepsHangs(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runID, _ := store.CreateRun(RunInfo{StartedAt: time.Now(), Image: "zoo"})
+	store.SaveTrial(runID, runner.TrialResult{Trial: runner.Trial{ID: 1}, Tests: []runner.TestOutcome{{Name: "d", Failed: true, Hung: true}}})
+	store.SaveTrial(runID, runner.TrialResult{Trial: runner.Trial{ID: 2, ReplayFor: "d"}, Tests: []runner.TestOutcome{{Name: "d", Failed: true, Hung: true}}})
+
+	agg, _ := store.LoadAggregate(runID)
+	if s := agg.Tests["d"]; s.Failures != 1 || s.Hangs != 1 {
+		t.Errorf("got %+v", s)
+	}
+	replays, _ := store.LoadReplays(runID)
+	if c := replays["d"]; c == nil || c.Failures != 1 {
+		t.Errorf("a timeout in a replay is a failure: %+v", replays)
 	}
 }

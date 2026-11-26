@@ -1,6 +1,8 @@
 {
   "tests.test_race::test_report_is_ready": {"cause": "timing"},
+  "tests.test_time_boundary::test_report_timestamp": {"cause": "timing"},
   "tests.test_network::test_fetch_status": {"cause": "network"},
+  "tests.test_deadlock::test_transfer_between_accounts": {"cause": "hang"},
   "tests.test_order::test_no_users_initially": {"cause": "order-dependent", "polluter": "tests.test_order::test_create_users"},
   "tests.test_random_data::test_price_per_percent": {"cause": "random data"},
   "tests.test_order::test_create_users": {"cause": "stable"},
