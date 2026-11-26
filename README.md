@@ -1,5 +1,7 @@
 # flakehunt
 
+[![ci](https://github.com/daphnezlin/flakehunt/actions/workflows/ci.yml/badge.svg)](https://github.com/daphnezlin/flakehunt/actions/workflows/ci.yml)
+
 Finds flaky tests and works out why they're flaky.
 
 It runs a test suite many times in parallel Docker containers under different
@@ -41,28 +43,34 @@ pasted into a GitHub issue.
 
 On [`flaky-zoo`](flaky-zoo), a set of tests that are flaky on purpose for known reasons: a timing
 race, a network timeout, an order dependency, a random data edge case, a deadlock that hangs, and
-a timestamp check that breaks when a second ticks over mid-test. 3 runs with the default settings
-on a MacBook Air:
+a timestamp check that breaks when a second ticks over mid-test. 3 runs each of the default
+adaptive design and a fixed design (135 full-suite trials, no focus trials) on a MacBook Air:
 
-| | Adaptive, default (3 runs) |
-|---|---|
-| Flaky tests found | 18/18 |
-| Stable tests wrongly flagged | 0/15 |
-| Causes correct | 17/18 |
-| Polluting test named correctly | 3/3 |
-| Test executions per run | 1,173 to 1,607 |
-| Wall time per run | 3m27s to 7m48s |
+| | Adaptive, default | Fixed, 135 trials |
+|---|---|---|
+| Flaky tests found | 18/18 | 18/18 |
+| Stable tests wrongly flagged | 0/15 | 0/15 |
+| Causes correct | 17/18 | 16/18 |
+| Polluting test named correctly | 3/3 | 3/3 |
+| Test executions per run | 1,173 to 1,607 | 1,857 to 1,901 |
+| Wall time per run | 3m27s to 7m48s | 3m8s to 3m30s |
 
-The miss is the timestamp test in one run. Its failure rate only goes from about 10% to 20% at
-half a CPU, and in that run it came out flat (15% vs 16%, roughly a 4% chance given measured
-timings). flakehunt stopped focusing on it and called it nondeterministic, which is the honest
-answer for that data. The other two runs labelled it timing.
+Every miss is the timestamp test. Its failure rate only goes from about 10% to 20% at half a CPU.
+Adaptive got it in 2 of 3 runs and fixed in 1 of 3. In the adaptive miss it came out flat (15% vs
+16%, roughly a 4% chance given measured timings). In the fixed misses the trend was there but too
+weak to survive the correction (in one, p = 0.018, adjusted 0.074). Both called it
+nondeterministic, which is the honest answer for that data.
 
-Tests with a small effect like that are the expensive case: the run that needed all 10 focus
-batches took 7m48s. On the zoo every test takes milliseconds and container startup dominates, so
-focusing on one test saves little. On a real suite with hundreds of tests, a focused trial runs 1
-or 2 tests instead of all of them, so the savings should be much bigger. That's checked in
-phase 3, along with a comparison against the fixed design on the current zoo.
+Adaptive ran about a quarter fewer test executions and got one more cause right, since its extra
+trials go to the tests that need them instead of rerunning the whole suite. It's slower in wall
+time, because focus batches run one after another with a check in between, and on the zoo every
+test takes milliseconds so container startup dominates. The run that needed all 10 focus batches
+took 7m48s. On a real suite with hundreds of tests, a focused trial runs 1 or 2 tests instead of
+all of them, so the savings should be much bigger. That's checked in phase 3.
+
+The fixed runs also turned up a bug: in one, the deadlock test was labelled order-dependent even
+though every failure was a timeout (see [Design notes](#design-notes)). The numbers above are after
+the fix, re-scored from the saved runs.
 
 This is a synthetic benchmark, so it mostly checks that nothing is broken. Real-world
 accuracy is next (see [Status](#status)).
@@ -121,7 +129,8 @@ latency in front of it:
 3. **Explain.** For each flaky test:
    - a one-sided permutation trend test checks if it fails more with less CPU or more latency,
      with Benjamini-Hochberg correction across every check
-   - tests that hit `--test-timeout` in at least half their failures are labelled hangs
+   - tests that hit `--test-timeout` in at least half their failures are labelled hangs, even if
+     their seed seems to explain them too
    - its failing seed is rerun with no limits. Failing every time means the seed alone causes it,
      but only if that streak is unlikely given how often the test fails anyway. If it isn't yet,
      the seed gets more reruns
@@ -167,6 +176,11 @@ flaky-zoo/          tests with known causes, used as a benchmark
 - **Seed evidence beats a chance trend.** Conditions are assigned at random, independently of seeds.
   So if a test's failing seed fails every rerun with no limits, any CPU or latency trend for it can
   only be chance. Those tests are labelled from the polluter search, with the trend as a note.
+- **A hang beats seed evidence.** Timing out on most failures is seen directly, while "the seed
+  causes it" is inferred from a few reruns. In a zoo run, the deadlock test's failing seed failed 5
+  reruns in a row by chance (about 0.5% at its 35% failure rate), so it was labelled order-dependent
+  despite timing out on all 47 of its failures. Hangs are now labelled hangs, with what the seed and
+  polluter search found in the detail, so a hang caused by another test still names that test.
 - **Replays are judged against the test's own failure rate.** A test that fails 90% of the time
   fails 5 reruns in a row 59% of the time, seed or no seed. So a failing-every-time streak only
   counts when its chance is under 5% (failure rate to the power of reruns), and tests that fail
@@ -219,10 +233,13 @@ cd flaky-zoo && docker build -t flaky-zoo . && cd ..
 go test -race ./...
 ```
 
+CI runs gofmt, `go vet`, the tests with the race detector, and a build on every push to main
+and every pull request. The unit tests don't need Docker, so they run on a plain Linux runner.
+
 ## Status
 
 Done: detection, cause analysis, hang detection, polluter search, network faults, adaptive
-sampling, markdown reports, scoring.
+sampling, markdown reports, scoring, CI.
 
 Next: running on real open source projects and scoring
-against [IDoFT](https://github.com/TestingResearchIllinois/idoft), CI, and releases.
+against [IDoFT](https://github.com/TestingResearchIllinois/idoft), and releases.
