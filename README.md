@@ -14,13 +14,16 @@ Supports pytest for now.
 Likely causes:
   tests.test_order::test_no_users_initially
     order-dependent: fails when it runs after tests.test_order::test_create_users, which leaves state behind
-    CPU trend p=0.605, latency trend p=0.681, failing seed rerun 5/5 failed, polluter search used 5 runs
+    CPU trend p=0.059 (adjusted 0.234), latency trend p=0.137 (adjusted 0.410), failing seed rerun 5/5 failed (3% chance at its 48% failure rate), polluter search used 10 runs
   tests.test_race::test_report_is_ready
     timing: fails more with less cpu, likely a race or a timeout that's too tight
-    CPU trend p<0.001 (adjusted <0.001), latency trend p=0.787, failing seed rerun 2/5 failed
+    CPU trend p=<0.001 (adjusted <0.001), latency trend p=0.320 (adjusted 0.664), failing seed rerun 2/5 failed
   tests.test_network::test_fetch_status
     network: fails more when the service responds slowly, likely a network timeout that's too tight
-    CPU trend p=0.431, latency trend p<0.001, failing seed rerun 0/5 failed
+    CPU trend p=0.541 (adjusted 0.699), latency trend p=<0.001 (adjusted <0.001), failing seed rerun 0/5 failed
+  tests.test_deadlock::test_transfer_between_accounts
+    hang: never finished in 17 of its 17 failures (hit the per-test timeout), likely a deadlock or waiting on something that doesn't come
+    CPU trend p=0.952 (adjusted 1.000), latency trend p=0.424 (adjusted 0.699), failing seed rerun 1/5 failed, hit the per-test timeout in 17 of 17 failures
 
 Reproduce:
   tests.test_order::test_no_users_initially
@@ -36,25 +39,30 @@ pasted into a GitHub issue.
 
 ## Results
 
-On [`flaky-zoo`](flaky-zoo), a set of tests that are flaky on purpose for known
-reasons (a timing race, a network timeout, an order dependency, a random data edge case):
+On [`flaky-zoo`](flaky-zoo), a set of tests that are flaky on purpose for known reasons: a timing
+race, a network timeout, an order dependency, a random data edge case, a deadlock that hangs, and
+a timestamp check that breaks when a second ticks over mid-test. 3 runs with the default settings
+on a MacBook Air:
 
-| | Fixed, 135 trials (3 runs) | Adaptive, default (3 runs) |
-|---|---|---|
-| Flaky tests found | 12/12 | 11/12 |
-| Stable tests wrongly flagged | 0/15 | 0/15 |
-| Causes correct | 12/12 | 11/12 |
-| Polluting test named correctly | 3/3 | 3/3 |
-| Test executions per run | ~1,410 | 735 to 841 |
+| | Adaptive, default (3 runs) |
+|---|---|
+| Flaky tests found | 18/18 |
+| Stable tests wrongly flagged | 0/15 |
+| Causes correct | 17/18 |
+| Polluting test named correctly | 3/3 |
+| Test executions per run | 1,173 to 1,607 |
+| Wall time per run | 3m27s to 7m48s |
 
-Adaptive sampling (see [How it works](#how-it-works)) got every cause right for the tests it
-caught, with about half the test executions. The one miss is the random data test, which fails
-about 4% of the time. 60 trials catch that roughly 90% of the time, and `--catch-rate 0.02`
-(149 trials) makes a miss very unlikely.
+The miss is the timestamp test in one run. Its failure rate only goes from about 10% to 20% at
+half a CPU, and in that run it came out flat (15% vs 16%, roughly a 4% chance given measured
+timings). flakehunt stopped focusing on it and called it nondeterministic, which is the honest
+answer for that data. The other two runs labelled it timing.
 
-On the zoo the tests take milliseconds and container startup dominates, so wall time depends
-more on how many focus batches a run needs (1m7s with none, 2m20s with three, vs about 2m10s
-fixed). On a suite that takes minutes, time scales with test executions.
+Tests with a small effect like that are the expensive case: the run that needed all 10 focus
+batches took 7m48s. On the zoo every test takes milliseconds and container startup dominates, so
+focusing on one test saves little. On a real suite with hundreds of tests, a focused trial runs 1
+or 2 tests instead of all of them, so the savings should be much bigger. That's checked in
+phase 3, along with a comparison against the fixed design on the current zoo.
 
 This is a synthetic benchmark, so it mostly checks that nothing is broken. Real-world
 accuracy is next (see [Status](#status)).
@@ -191,6 +199,9 @@ flaky-zoo/          tests with known causes, used as a benchmark
   it says so instead of guessing.
 - A test with two separate problems, like an order dependency and a timing race, is reported as
   order-dependent, with the timing trend treated as chance.
+- Tests with no sign of a CPU or network effect after 2 focus batches stop being focused. That saves
+  a lot on tests that are flaky for some other reason, but on unlucky data it occasionally gives up
+  on a small real effect, which then gets reported as nondeterministic.
 - Tests that fail when run twice in the same process (NIO in the IDoFT dataset) aren't detected,
   since each trial runs each test once.
 
