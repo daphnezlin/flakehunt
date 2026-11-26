@@ -223,6 +223,27 @@ func TestHangLabel(t *testing.T) {
 	}
 }
 
+func TestHangBeatsSeed(t *testing.T) {
+	// like run 26: the deadlock timed out on every failure, but its failing
+	// seed also failed 5/5 replays by chance and no single polluter was found
+	c := Cause{Hangs: 47, Failures: 47, BaseRate: 0.35, Replays: Count{Runs: 5, Failures: 5},
+		Polluter: &PolluterResult{Note: "fails only when several earlier tests run together"}}
+	label, detail := classify(c)
+	if label != "hang" || !strings.Contains(detail, "passes on its own") {
+		t.Errorf("got %q: %q", label, detail)
+	}
+	// a real polluter still shows up in the detail
+	c.Polluter = &PolluterResult{Polluter: "m::test_hold_lock"}
+	if label, detail := classify(c); label != "hang" || !strings.Contains(detail, "test_hold_lock") {
+		t.Errorf("got %q: %q", label, detail)
+	}
+	// a seed-determined test that doesn't hang keeps its seed label
+	c.Hangs = 0
+	if label, _ := classify(c); label != "order-dependent" {
+		t.Errorf("no hangs: got %q", label)
+	}
+}
+
 func TestSeedNeedsToBeatBaseRate(t *testing.T) {
 	five := Count{Runs: 5, Failures: 5}
 	// fails half the time anyway: 5 in a row by chance is 3%, so the seed is the cause

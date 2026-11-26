@@ -211,6 +211,12 @@ func classify(c Cause) (label, detail string) {
 	if !seed {
 		return label, detail
 	}
+	if c.Hung() {
+		// timing out on most failures is what the failure looks like, seen
+		// directly. the seed and polluter search say what sets it off, which
+		// is useful but weaker evidence, so it goes in the detail instead
+		return label, detail + hangTrigger(c.Polluter)
+	}
 
 	switch {
 	case seed && c.Polluter != nil:
@@ -254,6 +260,20 @@ func classifyOther(c Cause, cpu, net, replayed bool) (label, detail string) {
 		return "nondeterministic", "same seed sometimes passes, so not order or random data, and no clear link to cpu or network (try more runs)"
 	default:
 		return "unknown", "not enough evidence, try more runs or turn on replays"
+	}
+}
+
+// hangTrigger says what the seed evidence adds to a hang.
+func hangTrigger(p *PolluterResult) string {
+	switch {
+	case p == nil:
+		return " (its failing seed also failed every replay)"
+	case p.FailsAlone:
+		return " (its failing seed makes it fail even when run on its own)"
+	case p.Polluter != "":
+		return " (it hangs when it runs after " + p.Polluter + ")"
+	default:
+		return " (its failing seed failed every replay but it passes on its own, so earlier tests may make the hang more likely)"
 	}
 }
 
