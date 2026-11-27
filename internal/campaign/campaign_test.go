@@ -32,6 +32,7 @@ type fakeSuite struct {
 	focused        [][]string // Tests of every focus trial
 	focusLatencies []int
 	focusCPUs      []float64
+	replays        [][]string // ReplayFor of every replay trial
 }
 
 var nodes = map[string]string{
@@ -61,6 +62,11 @@ func (f *fakeSuite) Run(ctx context.Context, t runner.Trial) runner.TrialResult 
 		if f.noisy {
 			order = append(order, "t.py::noisy")
 		}
+	}
+	if t.Probe == "" && len(t.ReplayFor) > 0 {
+		f.mu.Lock()
+		f.replays = append(f.replays, t.ReplayFor)
+		f.mu.Unlock()
 	}
 	if t.Probe == "focus" {
 		f.mu.Lock()
@@ -170,26 +176,34 @@ func TestCampaignFocusesOnlyUnclearTests(t *testing.T) {
 }
 
 func TestCampaignSharesWorkBetweenVictims(t *testing.T) {
-	// two tests broken by the same polluter fail in the same trials. The second
-	// one shouldn't cost any extra replays, and its polluter search should
-	// only need to try the polluter the first search found
-	rates := map[float64]float64{0: 0.05, 1: 0.1, 0.5: 0.9}
+	// two tests broken by the same polluter fail in the same trials, so one set
+	// of replays should cover both, and the second polluter search should only
+	// need to try the polluter the first one found
+	suite := &fakeSuite{raceRate: map[float64]float64{0: 0.05, 1: 0.1, 0.5: 0.9}, order2: true}
 	cfg := baseConfig()
 	db, runID := newRun(t, cfg)
-	one, err := New(cfg, db, runID, &fakeSuite{raceRate: rates}).Run(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	db2, runID2 := newRun(t, cfg)
-	two, err := New(cfg, db2, runID2, &fakeSuite{raceRate: rates, order2: true}).Run(context.Background())
+	res, err := New(cfg, db, runID, suite).Run(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if two.Stats.Replay != one.Stats.Replay {
-		t.Errorf("a second victim with the same seed cost extra replays: %d vs %d", two.Stats.Replay, one.Stats.Replay)
+	// which trial counts as a test's first failure depends on which worker
+	// finishes first, so other tests may or may not share the seed too. Only
+	// check the two victims
+	victimReplays := 0
+	for _, targets := range suite.replays {
+		if contains(targets, "m::order") != contains(targets, "m::order2") {
+			t.Fatalf("a replay checked only one of the two victims: %v", targets)
+		}
+		if contains(targets, "m::order") {
+			victimReplays++
+		}
 	}
-	got := labels(two)
+	if victimReplays != cfg.Replays {
+		t.Errorf("the two victims got %d replays, want %d shared", victimReplays, cfg.Replays)
+	}
+
+	got := labels(res)
 	for _, name := range []string{"m::order", "m::order2"} {
 		if got[name].Label != "order-dependent" || got[name].Polluter.Polluter != "m::polluter" {
 			t.Errorf("%s: %+v", name, got[name])
@@ -197,17 +211,19 @@ func TestCampaignSharesWorkBetweenVictims(t *testing.T) {
 	}
 	// order is searched first (sorted by name). order2 has polluter and order
 	// before it, so a full search takes 3 probes, reusing the polluter takes 2
-	if p := two.Polluters["m::order2"].Probes; p != 2 {
+	if p := res.Polluters["m::order2"].Probes; p != 2 {
 		t.Errorf("order2 should take 2 probes (alone, then the known polluter), got %d", p)
 	}
 
 	// saved replays should count for both victims too
-	saved, err := db2.LoadReplays(runID2)
+	saved, err := db.LoadReplays(runID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved["m::order2"] == nil || saved["m::order2"].Runs != cfg.Replays {
-		t.Errorf("saved replays for order2: %+v", saved["m::order2"])
+	for _, name := range []string{"m::order", "m::order2"} {
+		if saved[name] == nil || saved[name].Runs != cfg.Replays {
+			t.Errorf("saved replays for %s: %+v", name, saved[name])
+		}
 	}
 }
 
