@@ -52,6 +52,28 @@ func TestScoreMistakes(t *testing.T) {
 	}
 }
 
+func TestScoreNotOrderDependent(t *testing.T) {
+	// IDoFT only says if a test is order-dependent or not (NOD)
+	agg, causes := zooResults()
+	exp := map[string]Expected{
+		"m::test_api":   {Cause: NotOrderDependent},
+		"m::test_empty": {Cause: NotOrderDependent}, // flakehunt says order-dependent, so wrong
+	}
+	for _, x := range Score(agg, causes, exp) {
+		if x.Test == "m::test_api" && !x.Correct {
+			t.Errorf("network should count as not order-dependent")
+		}
+		if x.Test == "m::test_empty" && x.Correct {
+			t.Errorf("order-dependent shouldn't count as not order-dependent")
+		}
+	}
+	for _, got := range []string{"stable", "unknown", "seed-dependent", "seed + timing"} {
+		if CauseMatches(got, NotOrderDependent) {
+			t.Errorf("%q shouldn't match", got)
+		}
+	}
+}
+
 func TestLoadExpected(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "expected.json")
 	os.WriteFile(path, []byte(`{"a::b": {"cause": "order-dependent", "polluter": "a::c"}, "a::d": {"cause": "stable"}}`), 0o644)

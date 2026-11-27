@@ -153,6 +153,7 @@ internal/analysis   counting results, statistics, causes, polluter search, scori
 internal/store      sqlite storage and migrations
 internal/report     terminal and markdown reports
 flaky-zoo/          tests with known causes, used as a benchmark
+benchmarks/         open source suites from IDoFT, with Dockerfiles and expected causes
 ```
 
 ## Design notes

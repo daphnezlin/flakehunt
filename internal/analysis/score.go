@@ -25,6 +25,23 @@ func LoadExpected(path string) (map[string]Expected, error) {
 	return exp, nil
 }
 
+// NotOrderDependent is the cause for a flaky test that isn't order-dependent,
+// without saying what it is. IDoFT only labels tests that way (its NOD category),
+// so it matches any flakehunt cause that doesn't come from test order.
+const NotOrderDependent = "not order-dependent"
+
+// CauseMatches says if what flakehunt said is the expected cause.
+func CauseMatches(got, want string) bool {
+	if want != NotOrderDependent {
+		return got == want
+	}
+	switch got {
+	case "timing", "network", "timing + network", "hang", "nondeterministic", "random data":
+		return true
+	}
+	return false
+}
+
 // Verdict compares what flakehunt said about one test to the expected answer.
 type Verdict struct {
 	Test     string
@@ -71,7 +88,7 @@ func Score(agg *Aggregate, causes []Cause, expected map[string]Expected) []Verdi
 		}
 		if e, ok := expected[name]; ok {
 			v.Want = e.Cause
-			v.Correct = v.Got == e.Cause && (e.Polluter == "" || v.Polluter == e.Polluter)
+			v.Correct = CauseMatches(v.Got, e.Cause) && (e.Polluter == "" || v.Polluter == e.Polluter)
 		}
 		out = append(out, v)
 	}
@@ -109,7 +126,7 @@ func Summarize(verdicts []Verdict, expected map[string]Expected) ScoreSummary {
 			if flagged {
 				s.FlakyFound++
 			}
-			if v.Got == v.Want {
+			if CauseMatches(v.Got, v.Want) {
 				s.CausesRight++
 			}
 			if p := expected[v.Test].Polluter; p != "" {

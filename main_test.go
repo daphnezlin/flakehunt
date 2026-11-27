@@ -25,3 +25,20 @@ func TestDetectTrials(t *testing.T) {
 		}
 	}
 }
+
+func TestServiceLatencies(t *testing.T) {
+	def := []int{0, 50, 150}
+	if got, err := serviceLatencies(def, false, true); err != nil || len(got) != 3 {
+		t.Errorf("with a service: got %v, %v", got, err)
+	}
+	// the default levels shouldn't stop a suite with no service from running
+	if got, err := serviceLatencies(def, false, false); err != nil || got != nil {
+		t.Errorf("default, no service: got %v, %v", got, err)
+	}
+	if _, err := serviceLatencies([]int{150}, true, false); err == nil {
+		t.Error("asked for latency with no service: want an error")
+	}
+	if got, err := serviceLatencies([]int{0}, true, false); err != nil || got != nil {
+		t.Errorf("asked for 0 with no service: got %v, %v", got, err)
+	}
+}

@@ -1,0 +1,15 @@
+# webssh's own pins at the IDoFT commit
+paramiko==2.7.1
+tornado==6.0.4
+# paramiko's deps, at the oldest versions with arm64 wheels so nothing has to
+# compile. cryptography 3.x makes test_get_pkey_obj_with_encrypted_new_rsa_key
+# fail every run (2.9.2 passes it but has no arm64 wheel). That test isn't
+# flaky, so flakehunt reports it as always failing and it doesn't affect results.
+cryptography==3.3.2
+bcrypt==3.2.2
+pynacl==1.5.0
+six==1.17.0
+# pytest 8 can't collect tornado 6.0's test classes
+pytest==7.4.4
+pytest-randomly==3.15.0
+pytest-timeout==2.4.0
