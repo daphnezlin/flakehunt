@@ -41,6 +41,8 @@ pasted into a GitHub issue.
 
 ## Results
 
+### flaky-zoo
+
 On [`flaky-zoo`](flaky-zoo), a set of tests that are flaky on purpose for known reasons: a timing
 race, a network timeout, an order dependency, a random data edge case, a deadlock that hangs, and
 a timestamp check that breaks when a second ticks over mid-test. 3 runs each of the default
@@ -66,14 +68,47 @@ trials go to the tests that need them instead of rerunning the whole suite. It's
 time, because focus batches run one after another with a check in between, and on the zoo every
 test takes milliseconds so container startup dominates. The run that needed all 10 focus batches
 took 7m48s. On a real suite with hundreds of tests, a focused trial runs 1 or 2 tests instead of
-all of them, so the savings should be much bigger. That's checked in phase 3.
+all of them, so the savings should be much bigger. That still needs a real suite with timing
+flakiness to check: webssh's flaky tests are all order-dependent, so it needed no focus trials.
 
 The fixed runs also turned up a bug: in one, the deadlock test was labelled order-dependent even
 though every failure was a timeout (see [Design notes](#design-notes)). The numbers above are after
 the fix, re-scored from the saved runs.
 
-This is a synthetic benchmark, so it mostly checks that nothing is broken. Real-world
-accuracy is next (see [Status](#status)).
+### webssh
+
+[webssh](https://github.com/huashengdun/webssh) at the commit where
+[IDoFT](https://github.com/TestingResearchIllinois/idoft) found its flaky tests (setup in
+[`benchmarks/webssh`](benchmarks/webssh)). IDoFT lists 29 flaky tests for it: 9 order-dependent
+and 20 not order-dependent (NOD). One run with the defaults:
+
+| | |
+|---|---|
+| IDoFT's flaky tests found | 27/29 |
+| Labelled order-dependent, with the polluting test named | 27/27 |
+| Other tests flagged flaky | 0/60 |
+| Causes matching IDoFT | 9/29 |
+
+All 27 fail together. `TestAppWithTooManyConnections` sets the global `maxconn` option to 1 and
+`TestAppBasic` never sets it back. It also leaves a connection open, so when it runs first,
+every Basic test that opens a connection gets "Too many live connections". The bug is still in
+webssh's latest code.
+
+The low cause score is mostly IDoFT's labels. It calls 18 of the 27 NOD, but they don't look it:
+the repro command fails every time, each test passes on its own, and none of them failed in any
+other trial, including at half a CPU. So flakehunt found no sign of flakiness besides test order.
+The 2 tests it missed passed all 60 trials, so if they're flaky, it's rarer than about 5%.
+
+The first version of the run cost far more than it needed to, because it handled each of the 27
+victims separately. Sharing that work (see [Design notes](#design-notes)) gave the same results
+for a third of the cost:
+
+| | Before | After |
+|---|---|---|
+| Replays | 135 | 5 |
+| Polluter search runs | 224 | 64 |
+| Test executions | 18,682 | 6,031 |
+| Wall time | 8m48s | 4m15s |
 
 ## Usage
 
@@ -133,10 +168,11 @@ latency in front of it:
      their seed seems to explain them too
    - its failing seed is rerun with no limits. Failing every time means the seed alone causes it,
      but only if that streak is unlikely given how often the test fails anyway. If it isn't yet,
-     the seed gets more reruns
+     the seed gets more reruns. Tests that first failed in the same trial share these reruns
    - for those, it's run alone. Failing alone means random data. Passing alone means another test
-     breaks it, and a binary search over the tests that ran before it finds which one. If rerunning
-     the exact failing order passes, the seed wasn't the cause after all
+     breaks it. Polluters already found for other tests are tried first, then a binary search over
+     the tests that ran before it finds which one. If rerunning the exact failing order passes, the
+     seed wasn't the cause after all
 4. **Focus.** Flaky tests whose cause is still unclear get extra trials running only those tests,
    in batches, at the mildest and harshest CPU limit. Latency is only varied for tests with some
    sign of a network effect. Each batch is followed by another check. Tests drop out as soon as
@@ -196,6 +232,11 @@ benchmarks/         open source suites from IDoFT, with Dockerfiles and expected
   from 19% to 33% failures at 0.5 CPU, this plus slowdown scoring and more batches took the chance
   of labelling it timing from about 30% to about 80% in simulation. Tests with no sign of any
   effect are dropped early, which can only make false timing or network labels rarer.
+- **Work is shared between victims.** One test that leaves state behind often breaks a whole
+  class. On webssh, 27 tests failed together, and checking each one separately reran the same seed
+  135 times and found the same polluter 27 times. Replays now go per failing seed instead of per
+  test, and the polluter search tries polluters it already found before doing a binary search.
+  That cut the run's test executions by 68% with the same results.
 - **Honest "stable".** Passing every one of n runs only rules out failure rates above roughly 3/n,
   so every report says what rate the run could have caught.
 - **Toxiproxy per trial, only when needed.** A shared proxy would let one trial's latency affect
@@ -220,13 +261,26 @@ benchmarks/         open source suites from IDoFT, with Dockerfiles and expected
 - Tests that fail when run twice in the same process (NIO in the IDoFT dataset) aren't detected,
   since each trial runs each test once.
 
-## Trying it on flaky-zoo
+## Trying it on the benchmarks
+
+flaky-zoo:
 
 ```
 cd flaky-zoo && docker build -t flaky-zoo . && cd ..
 ./flaky-zoo/run.sh
 ./flakehunt score <run id>
 ```
+
+webssh:
+
+```
+docker build -t flakehunt-webssh benchmarks/webssh
+./benchmarks/webssh/run.sh
+./flakehunt score --expected benchmarks/webssh/expected.json <run id>
+```
+
+[`benchmarks/idoft_expected.py`](benchmarks/idoft_expected.py) makes an `expected.json` for any
+project from IDoFT's `py-data.csv`.
 
 ## Tests
 
@@ -240,7 +294,7 @@ and every pull request. The unit tests don't need Docker, so they run on a plain
 ## Status
 
 Done: detection, cause analysis, hang detection, polluter search, network faults, adaptive
-sampling, markdown reports, scoring, CI.
+sampling, markdown reports, scoring, CI, and a first real project (webssh) scored against IDoFT.
 
-Next: running on real open source projects and scoring
-against [IDoFT](https://github.com/TestingResearchIllinois/idoft), and releases.
+Next: more real projects, including one with timing or network flakiness, a fix for webssh's
+flaky tests upstream, and releases.
