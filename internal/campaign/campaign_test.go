@@ -26,6 +26,7 @@ type fakeSuite struct {
 	aloneBump float64 // extra failure rate for race when it runs on its own
 	hot       bool    // add a test that fails 90% of the time for no particular reason
 	noisy     bool    // add a test that fails 30% of the time for no particular reason
+	order2    bool    // add a second test that polluter breaks, right after order
 
 	mu             sync.Mutex
 	focused        [][]string // Tests of every focus trial
@@ -36,7 +37,7 @@ type fakeSuite struct {
 var nodes = map[string]string{
 	"t.py::polluter": "m::polluter", "t.py::order": "m::order", "t.py::race": "m::race",
 	"t.py::api": "m::api", "t.py::ok": "m::ok", "t.py::hot": "m::hot",
-	"t.py::noisy": "m::noisy",
+	"t.py::noisy": "m::noisy", "t.py::order2": "m::order2",
 }
 
 func (f *fakeSuite) Run(ctx context.Context, t runner.Trial) runner.TrialResult {
@@ -45,6 +46,14 @@ func (f *fakeSuite) Run(ctx context.Context, t runner.Trial) runner.TrialResult 
 		order = []string{"t.py::order", "t.py::polluter", "t.py::race", "t.py::api", "t.py::ok"}
 		if t.Seed%2 == 0 {
 			order[0], order[1] = order[1], order[0]
+		}
+		if f.order2 {
+			for i, id := range order {
+				if id == "t.py::order" {
+					order = append(order[:i+1], append([]string{"t.py::order2"}, order[i+1:]...)...)
+					break
+				}
+			}
 		}
 		if f.hot {
 			order = append(order, "t.py::hot")
@@ -69,7 +78,7 @@ func (f *fakeSuite) Run(ctx context.Context, t runner.Trial) runner.TrialResult 
 		switch id {
 		case "t.py::polluter":
 			polluted = true
-		case "t.py::order":
+		case "t.py::order", "t.py::order2":
 			failed = polluted
 		case "t.py::race":
 			rate := f.raceRate[t.CPUs]
@@ -157,6 +166,48 @@ func TestCampaignFocusesOnlyUnclearTests(t *testing.T) {
 		if l != 0 {
 			t.Fatalf("focus trial with %dms latency for a test with no network hint", l)
 		}
+	}
+}
+
+func TestCampaignSharesWorkBetweenVictims(t *testing.T) {
+	// two tests broken by the same polluter fail in the same trials. The second
+	// one shouldn't cost any extra replays, and its polluter search should
+	// only need to try the polluter the first search found
+	rates := map[float64]float64{0: 0.05, 1: 0.1, 0.5: 0.9}
+	cfg := baseConfig()
+	db, runID := newRun(t, cfg)
+	one, err := New(cfg, db, runID, &fakeSuite{raceRate: rates}).Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db2, runID2 := newRun(t, cfg)
+	two, err := New(cfg, db2, runID2, &fakeSuite{raceRate: rates, order2: true}).Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if two.Stats.Replay != one.Stats.Replay {
+		t.Errorf("a second victim with the same seed cost extra replays: %d vs %d", two.Stats.Replay, one.Stats.Replay)
+	}
+	got := labels(two)
+	for _, name := range []string{"m::order", "m::order2"} {
+		if got[name].Label != "order-dependent" || got[name].Polluter.Polluter != "m::polluter" {
+			t.Errorf("%s: %+v", name, got[name])
+		}
+	}
+	// order is searched first (sorted by name). order2 has polluter and order
+	// before it, so a full search takes 3 probes, reusing the polluter takes 2
+	if p := two.Polluters["m::order2"].Probes; p != 2 {
+		t.Errorf("order2 should take 2 probes (alone, then the known polluter), got %d", p)
+	}
+
+	// saved replays should count for both victims too
+	saved, err := db2.LoadReplays(runID2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved["m::order2"] == nil || saved["m::order2"].Runs != cfg.Replays {
+		t.Errorf("saved replays for order2: %+v", saved["m::order2"])
 	}
 }
 

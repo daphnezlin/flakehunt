@@ -96,7 +96,7 @@ func TestReplaysKeptSeparate(t *testing.T) {
 	store.SaveTrial(runID, runner.TrialResult{Trial: runner.Trial{ID: 1, Seed: 9},
 		Tests: []runner.TestOutcome{{Name: "order", Failed: true}, {Name: "other"}}})
 	for i := 2; i <= 4; i++ {
-		store.SaveTrial(runID, runner.TrialResult{Trial: runner.Trial{ID: i, Seed: 9, ReplayFor: "order"},
+		store.SaveTrial(runID, runner.TrialResult{Trial: runner.Trial{ID: i, Seed: 9, ReplayFor: []string{"order"}},
 			Tests: []runner.TestOutcome{{Name: "order", Failed: true}, {Name: "other"}}})
 	}
 
@@ -123,6 +123,33 @@ func TestReplaysKeptSeparate(t *testing.T) {
 	}
 }
 
+func TestSharedReplay(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	runID, _ := store.CreateRun(RunInfo{StartedAt: time.Now(), Image: "zoo"})
+	// one replay checking two tests that failed with the same seed
+	store.SaveTrial(runID, runner.TrialResult{Trial: runner.Trial{ID: 1, Seed: 9, ReplayFor: []string{"a", "b"}},
+		Tests: []runner.TestOutcome{{Name: "a", Failed: true}, {Name: "b"}, {Name: "other", Failed: true}}})
+
+	replays, err := store.LoadReplays(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := replays["a"]; c == nil || c.Runs != 1 || c.Failures != 1 {
+		t.Errorf("a: %+v", c)
+	}
+	if c := replays["b"]; c == nil || c.Runs != 1 || c.Failures != 0 {
+		t.Errorf("b: %+v", c)
+	}
+	if _, ok := replays["other"]; ok {
+		t.Error("only target tests should count in a replay")
+	}
+}
+
 func TestPolluterStorage(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -132,8 +159,8 @@ func TestPolluterStorage(t *testing.T) {
 
 	runID, _ := store.CreateRun(RunInfo{StartedAt: time.Now(), Image: "zoo"})
 	// a replay and a probe for the same test; only the replay counts as a replay
-	store.SaveTrial(runID, runner.TrialResult{Trial: runner.Trial{ID: 1, ReplayFor: "v"}, Tests: []runner.TestOutcome{{Name: "v", Failed: true}}})
-	store.SaveTrial(runID, runner.TrialResult{Trial: runner.Trial{ID: 2, ReplayFor: "v", Probe: "polluter"}, Tests: []runner.TestOutcome{{Name: "v"}}})
+	store.SaveTrial(runID, runner.TrialResult{Trial: runner.Trial{ID: 1, ReplayFor: []string{"v"}}, Tests: []runner.TestOutcome{{Name: "v", Failed: true}}})
+	store.SaveTrial(runID, runner.TrialResult{Trial: runner.Trial{ID: 2, ReplayFor: []string{"v"}, Probe: "polluter"}, Tests: []runner.TestOutcome{{Name: "v"}}})
 
 	want := analysis.PolluterResult{Polluter: "p", PolluterNode: "t.py::p", VictimNode: "t.py::v", Probes: 4, Unreproduced: true}
 	if err := store.SavePolluter(runID, "v", want); err != nil {
@@ -239,7 +266,7 @@ func TestStoreKeepsHangs(t *testing.T) {
 	defer store.Close()
 	runID, _ := store.CreateRun(RunInfo{StartedAt: time.Now(), Image: "zoo"})
 	store.SaveTrial(runID, runner.TrialResult{Trial: runner.Trial{ID: 1}, Tests: []runner.TestOutcome{{Name: "d", Failed: true, Hung: true}}})
-	store.SaveTrial(runID, runner.TrialResult{Trial: runner.Trial{ID: 2, ReplayFor: "d"}, Tests: []runner.TestOutcome{{Name: "d", Failed: true, Hung: true}}})
+	store.SaveTrial(runID, runner.TrialResult{Trial: runner.Trial{ID: 2, ReplayFor: []string{"d"}}, Tests: []runner.TestOutcome{{Name: "d", Failed: true, Hung: true}}})
 
 	agg, _ := store.LoadAggregate(runID)
 	if s := agg.Tests["d"]; s.Failures != 1 || s.Hangs != 1 {
