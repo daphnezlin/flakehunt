@@ -79,13 +79,10 @@ func runCmd() *cobra.Command {
 			if svc.Image != "" {
 				svc.Cmd = strings.Fields(svcCmd)
 				service = &svc
-			} else {
-				for _, l := range latencies {
-					if l != 0 {
-						return fmt.Errorf("--latency-levels needs --service-image: latency is added between the tests and a service")
-					}
-				}
-				latencies = nil
+			}
+			latencies, err = serviceLatencies(latencies, cmd.Flags().Changed("latency-levels"), service != nil)
+			if err != nil {
+				return err
 			}
 
 			dr, err := runner.NewDockerRunner(ctx, image, outDir, env, workers, timeout, testTO, service, toxiImage)
@@ -385,6 +382,23 @@ func pct(a, b int) string {
 
 // detectTrials works out how many full-suite trials to run. --catch-rate picks
 // the count for you; --runs sets it directly. Both at once is ambiguous.
+// serviceLatencies works out the latency levels. Latency is added between the
+// tests and a service, so without one there's nothing to slow down: the default
+// levels are dropped, but levels the user asked for are an error.
+func serviceLatencies(levels []int, set, hasService bool) ([]int, error) {
+	if hasService {
+		return levels, nil
+	}
+	if set {
+		for _, l := range levels {
+			if l != 0 {
+				return nil, fmt.Errorf("--latency-levels needs --service-image: latency is added between the tests and a service")
+			}
+		}
+	}
+	return nil, nil
+}
+
 func detectTrials(runs int, runsSet bool, catchRate float64) (int, error) {
 	if catchRate == 0 {
 		if runs < 1 {

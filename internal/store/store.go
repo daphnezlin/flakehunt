@@ -84,6 +84,20 @@ var migrations = []string{
 	`
 	ALTER TABLE polluters ADD COLUMN unreproduced INTEGER NOT NULL DEFAULT 0;
 	`,
+	// 8: a replay can check several tests that failed with the same seed.
+	// trials.replay_for keeps the first one, so replay_for = '' still means a
+	// normal trial
+	`
+	CREATE TABLE replay_targets (
+		run_id   INTEGER NOT NULL,
+		trial_id INTEGER NOT NULL,
+		test     TEXT NOT NULL,
+		PRIMARY KEY (run_id, trial_id, test),
+		FOREIGN KEY (run_id, trial_id) REFERENCES trials(run_id, trial_id)
+	);
+	INSERT INTO replay_targets (run_id, trial_id, test)
+		SELECT run_id, trial_id, replay_for FROM trials WHERE replay_for != '';
+	`,
 }
 
 type Store struct {
@@ -226,13 +240,23 @@ func (s *Store) SaveTrial(runID int64, res runner.TrialResult) error {
 	case res.Err != nil:
 		status, errMsg = "error", res.Err.Error()
 	}
+	replayFor := ""
+	if len(res.Trial.ReplayFor) > 0 {
+		replayFor = res.Trial.ReplayFor[0]
+	}
 	if _, err := tx.Exec(
 		`INSERT INTO trials (run_id, trial_id, seed, cpus, latency_ms, cpuset, replay_for, probe, status, error)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		runID, res.Trial.ID, res.Trial.Seed, res.Trial.CPUs, res.Trial.LatencyMS, res.CPUSet,
-		res.Trial.ReplayFor, res.Trial.Probe, status, errMsg,
+		replayFor, res.Trial.Probe, status, errMsg,
 	); err != nil {
 		return err
+	}
+	for _, test := range res.Trial.ReplayFor {
+		if _, err := tx.Exec(`INSERT INTO replay_targets (run_id, trial_id, test) VALUES (?, ?, ?)`,
+			runID, res.Trial.ID, test); err != nil {
+			return err
+		}
 	}
 
 	stmt, err := tx.Prepare(`INSERT INTO results (run_id, trial_id, test, outcome) VALUES (?, ?, ?, ?)`)
@@ -371,9 +395,11 @@ func (s *Store) LoadAggregate(runID int64) (*analysis.Aggregate, error) {
 // LoadReplays counts how the target test did in each replay trial, keyed by test name.
 func (s *Store) LoadReplays(runID int64) (map[string]*analysis.Count, error) {
 	rows, err := s.db.Query(`
-		SELECT t.replay_for, r.outcome
-		FROM trials t JOIN results r ON r.run_id = t.run_id AND r.trial_id = t.trial_id
-		WHERE t.run_id = ? AND t.replay_for != '' AND t.probe = '' AND r.test = t.replay_for`, runID)
+		SELECT rt.test, r.outcome
+		FROM replay_targets rt
+		JOIN trials t ON t.run_id = rt.run_id AND t.trial_id = rt.trial_id
+		JOIN results r ON r.run_id = rt.run_id AND r.trial_id = rt.trial_id AND r.test = rt.test
+		WHERE rt.run_id = ? AND t.probe = ''`, runID)
 	if err != nil {
 		return nil, err
 	}

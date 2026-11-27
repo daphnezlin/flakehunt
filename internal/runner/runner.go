@@ -9,9 +9,10 @@ type Trial struct {
 	CPUs      float64 // cpu limit for this trial, 0 = no limit
 	LatencyMS int     // network latency added to the service, 0 = none
 
-	// set on replay and probe trials: the flaky test this rerun is checking.
-	// these don't count towards failure rates
-	ReplayFor string
+	// set on replay and probe trials: the flaky tests this rerun is checking.
+	// A replay can check several tests that failed with the same seed.
+	// These trials don't count towards failure rates
+	ReplayFor []string
 	Probe     string   // "polluter" for polluter search runs
 	Tests     []string // node ids to run in this order, empty = whole suite
 }

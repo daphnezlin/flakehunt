@@ -1,0 +1,89 @@
+{
+  "tests.test_app.TestAppBasic::test_app_auth_with_invalid_pubkey_for_user_robey": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_auth_with_pubkey_cannot_be_decoded_by_multipart_form": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_auth_with_pubkey_exceeds_key_max_size": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_auth_with_valid_pubkey_by_multipart_form": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_auth_with_valid_pubkey_by_urlencoded_form": {
+    "cause": "order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_post_form_with_large_body_size_by_multipart_form": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_post_form_with_large_body_size_by_urlencoded_form": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_correct_credentials": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_correct_credentials_but_empty_id": {
+    "cause": "order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_correct_credentials_but_ip_not_matched": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_correct_credentials_but_with_no_port": {
+    "cause": "order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_correct_credentials_but_without_id_argument": {
+    "cause": "order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_correct_credentials_but_wrong_id": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_correct_credentials_timeout": {
+    "cause": "order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_correct_credentials_user_bar": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_correct_credentials_user_robey": {
+    "cause": "order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_invalid_form_for_invalid_value": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_invalid_form_for_missing_argument": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_user_keyonly_for_bad_authentication_type": {
+    "cause": "order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_user_pass2fa_with_correct_passwords": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_user_pass2fa_with_wrong_pkey_correct_passwords": {
+    "cause": "order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_user_pkey2fa_with_correct_passwords": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_user_pkey2fa_with_empty_passcode": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_user_pkey2fa_with_wrong_passcode": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_user_pkey2fa_with_wrong_password": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_wrong_credentials": {
+    "cause": "order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_wrong_hostname_domain": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_wrong_hostname_ip": {
+    "cause": "not order-dependent"
+  },
+  "tests.test_app.TestAppBasic::test_app_with_wrong_port": {
+    "cause": "not order-dependent"
+  }
+}

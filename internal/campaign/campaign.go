@@ -188,11 +188,15 @@ func (c *Campaign) record(res runner.TrialResult, st stage) error {
 	return nil
 }
 
-// countReplay counts how the target test did. Same counting as
+// countReplay counts how each target test did. Same counting as
 // store.LoadReplays so live and saved reports match.
 func countReplay(counts map[string]*analysis.Count, res runner.TrialResult) {
+	targets := map[string]bool{}
+	for _, name := range res.Trial.ReplayFor {
+		targets[name] = true
+	}
 	for _, o := range res.Tests {
-		if o.Name != res.Trial.ReplayFor || o.Skip {
+		if !targets[o.Name] || o.Skip {
 			continue
 		}
 		cnt := counts[o.Name]
@@ -219,6 +223,11 @@ const replayRounds = 3
 // So when every replay so far failed but that's not convincing yet given how
 // often the test fails, it gets another round, up to replayRounds. A test the
 // seed really breaks keeps failing and the evidence adds up quickly.
+//
+// Tests whose first failure was in the same trial share its seed, so one
+// replay of that seed checks all of them. On a real suite one bad test often
+// breaks a whole class at once, and replaying per test would rerun the same
+// seed once for every victim.
 func (c *Campaign) replay(ctx context.Context) error {
 	var targets []string
 	for _, s := range c.res.Agg.Sorted() {
@@ -228,16 +237,24 @@ func (c *Campaign) replay(ctx context.Context) error {
 	}
 
 	for round := 1; round <= replayRounds && len(targets) > 0 && ctx.Err() == nil; round++ {
-		var trials []runner.Trial
+		var seeds []int64
+		bySeed := map[int64][]string{}
 		for _, name := range targets {
 			seed := c.res.Agg.Tests[name].Failing[0].Seed
+			if bySeed[seed] == nil {
+				seeds = append(seeds, seed)
+			}
+			bySeed[seed] = append(bySeed[seed], name)
+		}
+		var trials []runner.Trial
+		for _, seed := range seeds {
 			for i := 0; i < c.cfg.Replays; i++ {
 				c.lastID++
-				trials = append(trials, runner.Trial{ID: c.lastID, Seed: seed, ReplayFor: name})
+				trials = append(trials, runner.Trial{ID: c.lastID, Seed: seed, ReplayFor: bySeed[seed]})
 			}
 		}
 		if round == 1 {
-			fmt.Fprintln(c.cfg.Log, "  replaying failing seeds")
+			fmt.Fprintf(c.cfg.Log, "  replaying %d failing seed(s) for %d flaky test(s)\n", len(seeds), len(targets))
 		} else {
 			fmt.Fprintf(c.cfg.Log, "  more replays for %d test(s) that failed every replay but fail often anyway\n", len(targets))
 		}
@@ -258,7 +275,12 @@ func (c *Campaign) replay(ctx context.Context) error {
 
 // findPolluters runs FindPolluter for every seed-dependent test. Probes run
 // one at a time since each step of the search depends on the last one.
+//
+// Polluters already found are passed on to later searches. When one test
+// breaks many others, every victim after the first is checked against it in
+// one probe instead of a full binary search.
 func (c *Campaign) findPolluters(ctx context.Context) error {
+	var known []string
 	// every test whose failing seed failed every replay, even if a trend test
 	// also flagged cpu or latency: a chance trend shouldn't stop us finding the
 	// real cause and a minimal repro
@@ -277,7 +299,7 @@ func (c *Campaign) findPolluters(ctx context.Context) error {
 				return false, false, ctx.Err()
 			}
 			c.lastID++
-			res := c.rn.Run(ctx, runner.Trial{ID: c.lastID, Seed: seed, ReplayFor: cause.Test, Probe: "polluter", Tests: nodeIDs})
+			res := c.rn.Run(ctx, runner.Trial{ID: c.lastID, Seed: seed, ReplayFor: []string{cause.Test}, Probe: "polluter", Tests: nodeIDs})
 			if err := c.record(res, probe); err != nil {
 				saveErr = err
 				return false, false, err
@@ -296,9 +318,12 @@ func (c *Campaign) findPolluters(ctx context.Context) error {
 			return false, false, nil
 		}
 
-		result := analysis.FindPolluter(victim, before, probeFn)
+		result := analysis.FindPolluter(victim, before, known, probeFn)
 		if saveErr != nil {
 			return saveErr
+		}
+		if result.Polluter != "" && !contains(known, result.Polluter) {
+			known = append(known, result.Polluter)
 		}
 		if err := c.db.SavePolluter(c.runID, cause.Test, result); err != nil {
 			return err
@@ -471,4 +496,13 @@ func splitAt(outcomes []runner.TestOutcome, name string) (runner.TestOutcome, []
 		}
 	}
 	return runner.TestOutcome{Name: name}, nil
+}
+
+func contains(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }

@@ -21,15 +21,18 @@ type PolluterResult struct {
 type prober func(nodeIDs []string) (failed, ran bool, err error)
 
 // FindPolluter works out why victim fails with a given seed. before is every
-// test that ran before it in the failing run, in order.
+// test that ran before it in the failing run, in order. known is polluters
+// already found for other tests in this run.
 //
 //  1. run the victim alone. failing here means other tests aren't the cause
-//  2. run everything before it + victim, to make sure the failure reproduces
-//  3. binary search: keep whichever half of the earlier tests still makes it fail
+//  2. if a known polluter ran before it, run just that + victim. one test
+//     often breaks many, so this usually settles it in one probe
+//  3. run everything before it + victim, to make sure the failure reproduces
+//  4. binary search: keep whichever half of the earlier tests still makes it fail
 //
 // Assumes one test is enough to pollute. If neither half fails on its own,
 // it needs several tests together and we stop and say so.
-func FindPolluter(victim runner.TestOutcome, before []runner.TestOutcome, probe prober) PolluterResult {
+func FindPolluter(victim runner.TestOutcome, before []runner.TestOutcome, known []string, probe prober) PolluterResult {
 	res := PolluterResult{VictimNode: victim.NodeID}
 	if victim.NodeID == "" {
 		res.Note = "no file path in results, can't rerun single tests"
@@ -72,6 +75,22 @@ func FindPolluter(victim runner.TestOutcome, before []runner.TestOutcome, probe 
 	if len(cands) == 0 {
 		res.Note = "passes alone but nothing ran before it"
 		return res
+	}
+
+	for _, name := range known {
+		for _, t := range cands {
+			if t.Name != name {
+				continue
+			}
+			failed, ok = run([]runner.TestOutcome{t})
+			if !ok {
+				return res
+			}
+			if failed {
+				res.Polluter, res.PolluterNode = t.Name, t.NodeID
+				return res
+			}
+		}
 	}
 
 	failed, ok = run(cands)
