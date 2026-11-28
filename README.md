@@ -91,8 +91,9 @@ and 20 not order-dependent (NOD). One run with the defaults:
 
 All 27 fail together. `TestAppWithTooManyConnections` sets the global `maxconn` option to 1 and
 `TestAppBasic` never sets it back. It also leaves a connection open, so when it runs first,
-every Basic test that opens a connection gets "Too many live connections". The bug is still in
-webssh's latest code.
+every Basic test that opens a connection gets "Too many live connections". The bug was still in
+webssh's latest code, so I sent a one-line fix upstream:
+[huashengdun/webssh#423](https://github.com/huashengdun/webssh/pull/423).
 
 The low cause score is mostly IDoFT's labels. It calls 18 of the 27 NOD, but they don't look it:
 the repro command fails every time, each test passes on its own, and none of them failed in any
@@ -296,5 +297,7 @@ and every pull request. The unit tests don't need Docker, so they run on a plain
 Done: detection, cause analysis, hang detection, polluter search, network faults, adaptive
 sampling, markdown reports, scoring, CI, and a first real project (webssh) scored against IDoFT.
 
-Next: more real projects, including one with timing or network flakiness, a fix for webssh's
-flaky tests upstream, and releases.
+Next: more real projects, including one with timing or network flakiness, and releases.
+
+Upstream: [huashengdun/webssh#423](https://github.com/huashengdun/webssh/pull/423) fixes the
+order-dependent tests flakehunt found in webssh.
